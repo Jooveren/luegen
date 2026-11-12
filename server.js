@@ -47,6 +47,10 @@ var EVT = {
   ROOM_SETTINGS: "room:settings",
   ROOM_KICK: "room:kick",
   ROOM_ADD_BOT: "room:addBot",
+  ROOM_PHOTO: "room:photo",
+  // eigenes Bild setzen
+  ROOM_PHOTOS: "room:photos",
+  // Bilder der Mitspieler holen
   SK_BID: "sk:bid",
   SK_PLAY: "sk:play",
   SK_DOUBLE: "sk:double",
@@ -1357,6 +1361,7 @@ var Room = class {
         name: p.name,
         connected: p.connected,
         character: p.character,
+        ...p.photo && { photo: p.photoV },
         ...p.bot && { bot: true, difficulty: p.difficulty },
         ...p.autoplay && { autoplay: true }
       })),
@@ -1397,6 +1402,23 @@ var RoomManager = class {
     room.scores.ensure(player.name);
     if (!room.hostId) room.hostId = player.id;
     return player;
+  }
+  /** Eigenes Spielerbild setzen (kleines JPEG als Data-URL) oder entfernen. */
+  setPhoto(room, playerId, photo) {
+    const player = room.players.get(playerId);
+    if (!player) throw new GameError("BAD_TARGET", "Ung\xFCltiger Spieler.");
+    if (photo == null || photo === "") {
+      player.photo = null;
+    } else {
+      if (typeof photo !== "string" || !/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(photo) || photo.length > 4e4) {
+        throw new GameError("BAD_PHOTO", "Das Bild ist zu gro\xDF oder ung\xFCltig.");
+      }
+      player.photo = photo;
+    }
+    player.photoV = (player.photoV ?? 0) + 1;
+  }
+  photosOf(room) {
+    return Object.fromEntries([...room.players.values()].filter((p) => p.photo).map((p) => [p.id, p.photo]));
   }
   getRoom(code) {
     const room = this.rooms.get(normalizeCode(code));
@@ -2060,6 +2082,16 @@ function registerSocketHandlers(io, rooms, { pauseMs = DEFAULT_PAUSE_MS, botTimi
       return sessionPayload(room, player);
     });
     on(socket, EVT.LOBBY_LIST, () => ({ rooms: rooms.listOpenRooms() }));
+    on(socket, EVT.ROOM_PHOTO, ({ photo } = {}) => {
+      const { room, player } = ctx(socket);
+      rooms.setPhoto(room, player.id, photo);
+      broadcastState(room);
+      return {};
+    });
+    on(socket, EVT.ROOM_PHOTOS, () => {
+      const { room } = ctx(socket);
+      return { photos: rooms.photosOf(room) };
+    });
     on(socket, EVT.ROOM_LEAVE, () => {
       leaveCurrent(socket);
       return {};
