@@ -15,7 +15,7 @@ import { randomBytes, randomInt as randomInt2 } from "node:crypto";
 
 // ../shared/constants.js
 var SUITS = ["eichel", "gras", "herz", "schellen"];
-var RANKS = ["6", "8", "9", "10", "U", "O", "K", "A"];
+var RANKS = ["6", "7", "8", "9", "10", "U", "O", "K", "A"];
 var MIN_PLAYERS = 2;
 var MAX_PLAYERS = 7;
 var GAMES = { LUEGEN: "luegen", SCHAFKOPF: "schafkopf" };
@@ -31,7 +31,7 @@ var MODES = {
   SAME: "same",
   // Standard: Startspieler wählt den Wert frei, alle bedienen ihn bis „Lügner!“
   ASCENDING: "ascending"
-  // Wert steigt mit jedem Zug: 6 → 8 → 9 → 10 → U → K → A → 6 … (Ober wird übersprungen)
+  // Wert steigt mit jedem Zug: 6 → 7 → 8 → 9 → 10 → U → K → A → 6 … (Ober wird übersprungen)
 };
 var PHASES = {
   LOBBY: "lobby",
@@ -493,11 +493,11 @@ var CHARACTER_ORDER = BOT_ROSTER.map((b) => b.character);
 
 // ../shared/schafkopf/rules.js
 var SK_DECKS = {
-  lang: { ranks: ["8", "9", "10", "U", "O", "K", "A"], label: "Mit Achtern", handSize: 7, davonlaufen: 4 },
+  lang: { ranks: ["7", "8", "9", "10", "U", "O", "K", "A"], label: "Langes Blatt", handSize: 8, davonlaufen: 4 },
   kurz: { ranks: ["9", "10", "U", "O", "K", "A"], label: "Kurzes Blatt", handSize: 6, davonlaufen: 3 }
 };
 var SK_PLAYERS = 4;
-var CARD_POINTS = { A: 11, 10: 10, K: 4, O: 3, U: 2, 9: 0, 8: 0 };
+var CARD_POINTS = { A: 11, 10: 10, K: 4, O: 3, U: 2, 9: 0, 8: 0, 7: 0 };
 var SK_EXTRAS = {
   hochzeit: { label: "Hochzeit", default: true },
   bettel: { label: "Bettel & Bettel Brett", default: true },
@@ -523,13 +523,16 @@ var BASE = {
 var TOUT_ORDER = ["farbgeier", "geier", "farbwenz", "wenz", "solo"];
 var CONTRACTS = Object.fromEntries([
   ...Object.entries(BASE).map(([k, v]) => [k, { ...v, family: k.startsWith("bettel") ? "bettel" : k }]),
-  ...TOUT_ORDER.map((k, i) => [`${k}_tout`, { ...BASE[k], rank: 9 + i, label: `${BASE[k].label}-Tout`, tout: true, family: k }])
+  ...TOUT_ORDER.map((k, i) => [`${k}_tout`, { ...BASE[k], rank: 9 + i, label: `${BASE[k].label}-Tout`, tout: true, family: k }]),
+  ["sie", { rank: 14, label: "Sie", lords: "OU", solo: true, sie: true, tarif: "solo", family: "sie" }]
 ]);
 var RAMSCH = { rank: 0, label: "Ramsch", lords: "OU", trumpSuit: "herz", family: "ramsch" };
 var CALLABLE_SUITS = ["eichel", "gras", "schellen"];
+var CALL_NAMES = { eichel: "Eichel", gras: "Blaue", schellen: "Schelln" };
 var SUIT_ORDER = { eichel: 3, gras: 2, herz: 1, schellen: 0 };
-var PLAIN_ORDER = { A: 8, 10: 7, K: 6, O: 5, U: 5, 9: 4, 8: 3 };
-var BETTEL_ORDER = { A: 8, K: 7, O: 6, U: 5, 10: 4, 9: 3, 8: 2 };
+var PLAIN_ORDER = { A: 8, 10: 7, K: 6, O: 5, U: 5, 9: 4, 8: 3, 7: 2 };
+var BETTEL_ORDER = { A: 8, K: 7, O: 6, U: 5, 10: 4, 9: 3, 8: 2, 7: 1 };
+var SUIT_NAMES = { eichel: "Eichel", gras: "Gras", herz: "Herz", schellen: "Schellen" };
 function meta(contract) {
   if (!contract) return CONTRACTS.sauspiel;
   if (contract.type === "ramsch") return RAMSCH;
@@ -612,12 +615,22 @@ function legalCards(hand, ctx) {
   }
   return hand;
 }
+function contractLabel(contract) {
+  if (!contract) return "";
+  if (contract.type === "ramsch") return "Ramsch";
+  if (contract.type === "sauspiel") return `Sauspiel auf die ${CALL_NAMES[contract.suit]}`;
+  const m = meta(contract);
+  const suit = SUIT_NAMES[contract.suit] ?? "";
+  if (m.family === "solo") return `${suit}-${m.label}`;
+  if (m.suit) return `${m.label} ${suit}`;
+  return m.label;
+}
 
 // ../shared/schafkopf/SchafkopfGame.js
 var SK_PHASES = { KLOPFEN: "klopfen", BIDDING: "bidding", WEDDING: "wedding", PLAYING: "playing", SCORED: "scored" };
 var DOUBLE_KINDS = ["kontra", "re", "supra", "resupra"];
 var SAUSPIEL = { type: "sauspiel" };
-var SchafkopfGame = class {
+var SchafkopfGame = class _SchafkopfGame {
   /**
    * @param {{id:string}[]} players genau 4, in Sitzreihenfolge (im Uhrzeigersinn)
    * @param {{variant?:'lang'|'kurz', pass?:'ramsch'|'stock'|'thrown', ramsch?:boolean, extras?:object, dealerIndex?:number, rand?:Function, deck?:object[]}} opts
@@ -721,10 +734,10 @@ var SchafkopfGame = class {
     const extra = CONTRACTS[type]?.extra;
     return !extra || this.extras[extra];
   }
-  /** Welche Spiele darf dieser Spieler jetzt ansagen? */
-  allowedBids(playerId) {
-    if (this.phase !== SK_PHASES.BIDDING || this.currentPlayerId !== playerId) return [];
-    const best = this.#bestBid();
+  /** Welche Spiele darf dieser Spieler jetzt ansagen? (opts.anyTime: ohne Zug-/Rang-Prüfung – für den Berater) */
+  allowedBids(playerId, opts = {}) {
+    if (!opts.anyTime && (this.phase !== SK_PHASES.BIDDING || this.currentPlayerId !== playerId)) return [];
+    const best = opts.anyTime ? null : this.#bestBid();
     const min = best ? CONTRACTS[best.contract.type].rank : 0;
     const hand = this.hands.get(playerId);
     const out = [];
@@ -736,6 +749,8 @@ var SchafkopfGame = class {
           const hasSuit = hand.some((c) => c.suit === suit && c.rank !== "O" && c.rank !== "U");
           if (!hasAce && hasSuit) out.push({ type, suit });
         }
+      } else if (type === "sie") {
+        if (hand.filter((c) => c.rank === "O" || c.rank === "U").length === 8) out.push({ type });
       } else if (type === "hochzeit") {
         if (hand.filter((c) => isTrump(c, SAUSPIEL)).length === 1) out.push({ type });
       } else if (m.suit) {
@@ -783,6 +798,16 @@ var SchafkopfGame = class {
       return { wedding: { offererId: best.playerId } };
     }
     this.contract = { ...c, declarerId: best.playerId };
+    if (c.type === "sie") {
+      const value = (SK_TARIF.solo + 8 * SK_TARIF.extra) * 4 * this.multiplier;
+      const payout = Object.fromEntries(this.order.map((id) => [id, id === best.playerId ? 3 * value : -value]));
+      this.phase = SK_PHASES.SCORED;
+      for (const id of this.order) this.balances[id] += payout[id];
+      this.result = { type: "sie", contract: this.publicContract(), team: [best.playerId], won: true, laufende: 8, knocks: this.knocks.length, doubles: [], value, payout };
+      this.history.unshift({ round: this.round, contract: this.publicContract(), payout });
+      this.seq += 1;
+      return { final: this.publicContract(), result: this.result };
+    }
     if (c.type === "sauspiel") {
       this.contract.calledSuit = c.suit;
       this.contract.partnerId = this.order.find((id) => this.hands.get(id).some((x) => x.suit === c.suit && x.rank === "A"));
@@ -1078,6 +1103,39 @@ var SchafkopfGame = class {
   #unplayedPoints() {
     return this.order.reduce((s, id) => s + cardPoints(this.hands.get(id)), 0);
   }
+  /**
+   * Kopie für Simulationen (Berater): gleicher Spielstand, aber andere (geratene) Hände der Mitspieler.
+   * hands: Map id → Karten. Bereits gespielte Karten bleiben, wie sie sind.
+   */
+  cloneForSim(hands) {
+    const g = new _SchafkopfGame(
+      this.order.map((id) => ({ id })),
+      { variant: this.variant, pass: this.pass, extras: { ...this.extras, klopfen: false }, dealerIndex: this.dealerIndex, rand: this.rand }
+    );
+    const playedBy = (id) => [...this.tricks.flatMap((t) => t.cards), ...this.trick].filter((x) => x.playerId === id).map((x) => x.card);
+    g.hands = new Map(this.order.map((id) => [id, [...hands.get(id)]]));
+    g.dealt = new Map(this.order.map((id) => [id, [...hands.get(id), ...playedBy(id)]]));
+    g.knocks = [...this.knocks];
+    g.knockVotes = [...this.knockVotes];
+    g.bids = this.bids.map((b) => ({ ...b }));
+    g.contract = this.contract ? { ...this.contract } : null;
+    g.wedding = this.wedding ? { ...this.wedding, candidates: [...this.wedding.candidates] } : null;
+    g.turn = this.turn;
+    g.trick = this.trick.map((t) => ({ ...t }));
+    g.tricks = this.tricks.map((t) => ({ ...t, cards: t.cards.map((x) => ({ ...x })) }));
+    g.won = Object.fromEntries(Object.entries(this.won).map(([k, v]) => [k, [...v]]));
+    g.searched = this.searched;
+    g.ranAway = this.ranAway;
+    g.partnerRevealed = this.partnerRevealed;
+    g.doubles = this.doubles.map((d) => ({ ...d }));
+    g.phase = this.phase === SK_PHASES.KLOPFEN ? SK_PHASES.BIDDING : this.phase;
+    g.stock = this.stock;
+    if (g.contract?.calledSuit && !this.partnerRevealed) {
+      const holder = this.order.find((id) => g.hands.get(id).some((x) => x.suit === g.contract.calledSuit && x.rank === "A"));
+      if (holder) g.contract.partnerId = holder;
+    }
+    return g;
+  }
   replacePlayer(oldId, newId2) {
     const i = this.order.indexOf(oldId);
     if (i < 0) return;
@@ -1168,6 +1226,57 @@ var SchafkopfGame = class {
   }
 };
 
+// ../shared/score/ScoreBook.js
+var LUEGEN_STAKE = 10;
+var MAX_ROUNDS = 200;
+var clampName = (n) => String(n ?? "").slice(0, 24);
+var ScoreBook = class {
+  constructor(data) {
+    this.totals = {};
+    this.rounds = [];
+    if (data && typeof data === "object") {
+      for (const [name, v] of Object.entries(data.totals ?? {})) if (Number.isFinite(v)) this.totals[clampName(name)] = Math.round(v);
+      for (const r of (Array.isArray(data.rounds) ? data.rounds : []).slice(-MAX_ROUNDS)) {
+        if (!r || typeof r !== "object" || typeof r.deltas !== "object") continue;
+        const deltas = {};
+        for (const [name, v] of Object.entries(r.deltas)) if (Number.isFinite(v)) deltas[clampName(name)] = Math.round(v);
+        this.rounds.push({ no: Number(r.no) || this.rounds.length + 1, game: r.game === "schafkopf" ? "schafkopf" : "luegen", label: String(r.label ?? "").slice(0, 80), deltas, at: Number(r.at) || 0 });
+      }
+    }
+  }
+  /** Runde eintragen: deltas = { Name: Cent } */
+  record({ game, label, deltas }) {
+    const clean = {};
+    for (const [name, v] of Object.entries(deltas)) {
+      const n = clampName(name);
+      clean[n] = Math.round(v);
+      this.totals[n] = (this.totals[n] ?? 0) + clean[n];
+    }
+    const round = { no: (this.rounds.at(-1)?.no ?? 0) + 1, game, label, deltas: clean, at: Date.now() };
+    this.rounds.push(round);
+    if (this.rounds.length > MAX_ROUNDS) this.rounds.shift();
+    return round;
+  }
+  /** Name sicherstellen (neue Mitspieler starten mit 0). */
+  ensure(name) {
+    const n = clampName(name);
+    if (!(n in this.totals)) this.totals[n] = 0;
+  }
+  rename(oldName, newName) {
+    if (oldName === newName || !(oldName in this.totals)) return;
+    this.totals[newName] = (this.totals[newName] ?? 0) + this.totals[oldName];
+    delete this.totals[oldName];
+  }
+  toJSON(limit = MAX_ROUNDS) {
+    return { totals: { ...this.totals }, rounds: this.rounds.slice(-limit) };
+  }
+};
+function luegenDeltas(names, loserName, stake = LUEGEN_STAKE) {
+  const deltas = Object.fromEntries(names.map((n) => [n, stake]));
+  deltas[loserName] = -stake * (names.length - 1);
+  return deltas;
+}
+
 // src/rooms/RoomManager.js
 var CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 var newId = () => randomBytes(8).toString("hex");
@@ -1187,6 +1296,10 @@ var Room = class {
     this.players = /* @__PURE__ */ new Map();
     this.settings = { mode: MODES.SAME, public: true, game: GAMES.LUEGEN, skVariant: "lang", skPass: "ramsch", skExtras: defaultExtras() };
     this.ready = /* @__PURE__ */ new Set();
+    this.scores = new ScoreBook();
+    this.names = /* @__PURE__ */ new Map();
+    this.savedId = null;
+    this.gameNames = [];
     this.game = null;
     this.chat = [];
     this.pauses = /* @__PURE__ */ new Map();
@@ -1248,6 +1361,8 @@ var Room = class {
         ...p.autoplay && { autoplay: true }
       })),
       ready: [...this.ready],
+      scores: this.scores.toJSON(80),
+      savedId: this.savedId,
       game: this.game ? this.game.getStateFor(viewerId) : null,
       // Spiel pausiert, weil jemand die Verbindung verloren hat (Restzeit in ms)
       pauses: [...this.pauses].map(([playerId, until]) => ({ playerId, remainingMs: Math.max(0, until - Date.now()) })),
@@ -1278,6 +1393,8 @@ var RoomManager = class {
       character: room.freeCharacter(room.players.size + 1)
     };
     room.players.set(player.id, player);
+    room.names.set(player.id, player.name);
+    room.scores.ensure(player.name);
     if (!room.hostId) room.hostId = player.id;
     return player;
   }
@@ -1286,11 +1403,44 @@ var RoomManager = class {
     if (!room) throw new GameError("ROOM_NOT_FOUND", "Raum nicht gefunden. Code pr\xFCfen?");
     return room;
   }
-  createRoom(name) {
+  /** Neuer Tisch – optional aus einem gespeicherten Tisch (Regeln, Computer-Gegner, Kasse). */
+  createRoom(name, restore) {
     const room = new Room(this.#generateCode());
     this.rooms.set(room.code, room);
+    if (restore && typeof restore === "object") room.scores = new ScoreBook(restore.scores);
     const player = this.#addPlayer(room, name);
+    if (restore && typeof restore === "object") {
+      try {
+        this.updateSettings(room, player.id, { ...restore.settings ?? {} });
+      } catch {
+      }
+      room.savedId = typeof restore.savedId === "string" ? restore.savedId.slice(0, 40) : null;
+      for (const b of (Array.isArray(restore.bots) ? restore.bots : []).slice(0, room.maxPlayers - 1)) {
+        this.#createBot(room, b?.difficulty, { name: b?.name, character: b?.character });
+      }
+    }
     return { room, player };
+  }
+  /** Abgeschlossene Runden in die Kasse eintragen (einmal je Runde). */
+  recordIfDone(room) {
+    const g = room.game;
+    if (!g) return null;
+    const nameOf = (id) => room.players.get(id)?.name ?? room.names.get(id) ?? "?";
+    if (g.kind === "schafkopf") {
+      if (g.phase !== "scored" || g.recordedRound === g.round || !g.result) return null;
+      g.recordedRound = g.round;
+      const r = g.result;
+      if (r.type === "thrown" || r.type === "aborted") return null;
+      const deltas = Object.fromEntries(Object.entries(r.payout).map(([id, v]) => [nameOf(id), v]));
+      const label = r.type === "ramsch" ? r.durchmarschId ? `Ramsch \u2013 Durchmarsch ${nameOf(r.durchmarschId)}` : `Ramsch \u2013 ${nameOf(r.loserId)} zahlt` : r.type === "stock" ? "Stock (alle weiter)" : `${contractLabel(r.contract)} \xB7 ${nameOf(r.contract.declarerId)} ${r.won ? "gewinnt" : "verliert"}`;
+      return room.scores.record({ game: "schafkopf", label, deltas });
+    }
+    if (g.phase !== PHASES.FINISHED || g.recorded || !g.loserId) return null;
+    g.recorded = true;
+    const names = room.gameNames.length ? room.gameNames : g.order.map(nameOf);
+    const loser = nameOf(g.loserId);
+    const reason = { ober: "vier Ober", ober_patt: "Ober-Patt", most_cards: "die meisten Karten" }[g.endReason];
+    return room.scores.record({ game: "luegen", label: `L\xFCgen \u2013 ${loser} verliert${reason ? ` (${reason})` : ""}`, deltas: luegenDeltas(names, loser) });
   }
   joinRoom(code, name) {
     const room = this.getRoom(code);
@@ -1339,14 +1489,21 @@ var RoomManager = class {
     if (room.players.size >= room.maxPlayers) throw new GameError("ROOM_FULL", `Raum ist voll (max. ${room.maxPlayers}).`);
     return this.#createBot(room, difficulty);
   }
-  #createBot(room, difficulty) {
+  #createBot(room, difficulty, preset = {}) {
     if (!DIFFICULTY[difficulty]) difficulty = "normal";
     const usedChars = new Set([...room.players.values()].map((p) => p.character));
     const free = BOT_ROSTER.filter((b) => !usedChars.has(b.character));
-    const pick = (free.length ? free : BOT_ROSTER)[randomInt2((free.length ? free : BOT_ROSTER).length)];
+    const wanted = BOT_ROSTER.find((b) => b.character === preset.character && !usedChars.has(b.character));
+    const pick = wanted ?? (free.length ? free : BOT_ROSTER)[randomInt2((free.length ? free : BOT_ROSTER).length)];
+    let presetName = null;
+    try {
+      presetName = preset.name ? sanitizeName(preset.name) : null;
+    } catch {
+      presetName = null;
+    }
     const bot = {
       id: newId(),
-      name: room.uniqueName(pick.name),
+      name: room.uniqueName(presetName ?? pick.name),
       token: null,
       socketId: null,
       connected: true,
@@ -1357,6 +1514,8 @@ var RoomManager = class {
       base: pick.persona
     };
     room.players.set(bot.id, bot);
+    room.names.set(bot.id, bot.name);
+    room.scores.ensure(bot.name);
     return bot;
   }
   updateSettings(room, playerId, settings) {
@@ -1410,6 +1569,7 @@ var RoomManager = class {
     }
     if (room.players.size < MIN_PLAYERS) throw new GameError("PLAYER_COUNT", `Mindestens ${MIN_PLAYERS} Spieler n\xF6tig.`);
     room.game = new LuegenGame([...room.players.values()], { mode: room.settings.mode });
+    room.gameNames = [...room.players.values()].map((p) => p.name);
     room.botMemory = { claimed: {} };
     room.botKey = null;
     room.personas = Object.fromEntries(
@@ -1481,6 +1641,7 @@ function chooseBid(view, persona = {}) {
   const aggro = (persona.bluff ?? 0.4) - 0.4;
   const can = (type, suit) => allowed.find((b2) => b2.type === type && (b2.suit ?? null) === (suit ?? null));
   const candidates = [];
+  if (can("sie")) return can("sie");
   for (const suit of SUITS) {
     const s = strength(hand, { type: "solo", suit });
     if (s.t === hs && s.tops >= 3 && s.top && s.lords >= hs - 1) candidates.push(can("solo_tout", suit));
@@ -1558,10 +1719,14 @@ function currentWinner(trick, contract) {
   for (let i = 1; i < trick.length; i++) if (beats(trick[i].card, trick[best].card, led, contract)) best = i;
   return trick[best];
 }
-function choosePlayCard(view, me, persona = {}, rand = Math.random) {
+function choosePlayCard(view, me, persona = {}, rand = Math.random, out = null) {
+  const R = (card, reason) => {
+    if (out) out.reason = reason;
+    return card;
+  };
   const legal = view.hand.filter((c2) => view.legalCardIds.includes(c2.id));
-  if (legal.length <= 1) return legal[0];
-  if (rand() > (persona.sharp ?? 0.75) + 0.25) return legal[Math.floor(rand() * legal.length)];
+  if (legal.length <= 1) return R(legal[0], "Die einzige Karte, die du legen darfst.");
+  if (rand() > (persona.sharp ?? 0.75) + 0.25) return R(legal[Math.floor(rand() * legal.length)], "Aus dem Bauch heraus.");
   const c = view.contract;
   const m = meta(c);
   const rel = relationFn(view, me);
@@ -1571,26 +1736,26 @@ function choosePlayCard(view, me, persona = {}, rand = Math.random) {
   const played = new Set(view.played ?? []);
   if (m.bettel) {
     const declarer = me === c.declarerId;
-    if (!trick.length) return [...legal].sort(byPower)[0];
+    if (!trick.length) return R([...legal].sort(byPower)[0], declarer ? "Im Bettel klein ausspielen \u2013 dann sticht sicher ein anderer." : "Klein ausspielen und hoffen, dass der Spieler dr\xFCber muss.");
     const best2 = currentWinner(trick, c);
     const led2 = followSuit(trick[0].card, c);
     const under = legal.filter((x) => !beats(x, best2.card, led2, c)).sort(byPower);
-    if (declarer) return under.length ? under.at(-1) : [...legal].sort(byPower)[0];
-    if (best2.playerId === c.declarerId) return under.length ? under.at(-1) : [...legal].sort(byPower)[0];
+    if (declarer) return under.length ? R(under.at(-1), "Drunter bleiben \u2013 und dabei die h\xF6chste Karte loswerden, die noch nicht sticht.") : R([...legal].sort(byPower)[0], "Du musst leider stechen \u2013 nimm die kleinste Karte.");
+    if (best2.playerId === c.declarerId) return under.length ? R(under.at(-1), "Der Spieler liegt vorn \u2013 nicht \xFCberstechen, dann hat er den Stich!") : R([...legal].sort(byPower)[0], "Kleinste Karte.");
     const declarerStillToPlay = !trick.some((t) => t.playerId === c.declarerId);
-    return declarerStillToPlay ? [...legal].sort(byPower)[0] : [...legal].sort(byPower).at(-1);
+    return declarerStillToPlay ? R([...legal].sort(byPower)[0], "Klein bleiben, damit der Spieler dr\xFCber muss.") : R([...legal].sort(byPower).at(-1), "Der Spieler hat schon gelegt \u2013 hohe Karte loswerden.");
   }
   if (c.type === "ramsch") {
     if (!trick.length) {
       const plain = legal.filter((x) => !isTrump(x, c)).sort((a, b) => pts(a) - pts(b) || byPower(a, b));
-      return plain[0] ?? [...legal].sort(byPower)[0];
+      return R(plain[0] ?? [...legal].sort(byPower)[0], "Im Ramsch kleine Fehlkarten ausspielen \u2013 keine Augen verschenken.");
     }
     const best2 = currentWinner(trick, c);
     const led2 = followSuit(trick[0].card, c);
     const losers2 = legal.filter((x) => !beats(x, best2.card, led2, c));
-    if (losers2.length) return losers2.sort((a, b) => pts(b) - pts(a) || byPower(b, a))[0];
+    if (losers2.length) return R(losers2.sort((a, b) => pts(b) - pts(a) || byPower(b, a))[0], "Nicht stechen \u2013 und dabei m\xF6glichst viele Augen an den anderen loswerden.");
     const winners2 = legal.filter((x) => beats(x, best2.card, led2, c));
-    return trick.length === 3 ? winners2.sort((a, b) => pts(b) - pts(a))[0] : winners2.sort(byPower).at(-1);
+    return trick.length === 3 ? R(winners2.sort((a, b) => pts(b) - pts(a))[0], "Den Stich musst du nehmen \u2013 dann wenigstens mit einer hohen Karte, die sp\xE4ter gef\xE4hrlich w\xE4re.") : R(winners2.sort(byPower).at(-1), "Du musst stechen \u2013 nimm die h\xF6chste, damit sie weg ist.");
   }
   if (!trick.length) {
     const iAmPlayer = me === c.declarerId || me === c.partnerId;
@@ -1602,18 +1767,18 @@ function choosePlayCard(view, me, persona = {}, rand = Math.random) {
       if (trumps.length && otherTrumps.length) {
         const highest = trumps.at(-1);
         const higherOut = otherTrumps.some((x) => trumpPower(x, c) > trumpPower(highest, c));
-        return higherOut && trumps.length > 1 ? trumps[0] : highest;
+        return higherOut && trumps.length > 1 ? R(trumps[0], "Als Spieler Trumpf spielen, um den Gegnern die Tr\xFCmpfe herauszuziehen \u2013 mit einem kleinen, weil noch h\xF6here drau\xDFen sind.") : R(highest, "Dein h\xF6chster Trumpf ist gerade der h\xF6chste im Spiel \u2013 damit holst du sicher den Stich und ziehst Tr\xFCmpfe.");
       }
-      if (aces.length) return aces[0];
+      if (aces.length) return R(aces[0], "Die Tr\xFCmpfe sind raus \u2013 jetzt die Sau holen, solange sie noch durchgeht.");
     } else {
       if (c.calledSuit && !view.searched) {
         const search = legal.filter((x) => !isTrump(x, c) && x.suit === c.calledSuit).sort(byPower);
-        if (search.length) return search[0];
+        if (search.length) return R(search[0], "Als Gegenspieler die gerufene Sau suchen \u2013 dann muss sie kommen und du wei\xDFt, wer Partner ist.");
       }
-      if (aces.length) return aces[0];
+      if (aces.length) return R(aces[0], "Eine Sau ausspielen holt sicher 11 Augen, solange die Farbe noch nicht gestochen wird.");
     }
     const plain = legal.filter((x) => !isTrump(x, c)).sort((a, b) => pts(a) - pts(b) || byPower(a, b));
-    return plain[0] ?? trumps[0] ?? legal[0];
+    return R(plain[0] ?? trumps[0] ?? legal[0], "Eine kleine Karte ohne Augen ausspielen \u2013 nichts verschenken.");
   }
   const best = currentWinner(trick, c);
   const led = followSuit(trick[0].card, c);
@@ -1625,18 +1790,18 @@ function choosePlayCard(view, me, persona = {}, rand = Math.random) {
   const strongWin = isTrump(best.card, c) ? trumpPower(best.card, c) >= 40 : best.card.rank === "A";
   if (r === "friend" && (last || strongWin)) {
     const smearScore = (x) => pts(x) - (isTrump(x, c) && x.rank !== "A" && x.rank !== "10" ? 6 : 0);
-    return [...legal].sort((a, b) => smearScore(b) - smearScore(a))[0];
+    return R([...legal].sort((a, b) => smearScore(b) - smearScore(a))[0], "Dein Partner hat den Stich sicher \u2013 schmier ihm viele Augen (Sau oder Zehner).");
   }
   if (winners.length && r !== "friend") {
     const worth = trickPts >= 4 || last || trick.some((t) => t.card.rank === "A" || t.card.rank === "10");
     if (worth) {
-      if (last) return winners[0];
+      if (last) return R(winners[0], `Als Letzter mit der kleinsten Karte stechen, die reicht \u2013 ${trickPts} Augen liegen drin.`);
       const safe = winners.filter((x) => isTrump(x, c) && trumpPower(x, c) >= 40);
-      return trickPts >= 10 && safe.length ? safe[0] : winners[0];
+      return trickPts >= 10 && safe.length ? R(safe[0], `Viele Augen im Stich (${trickPts}) \u2013 mit einem Ober sicher stechen, damit keiner mehr dr\xFCber kommt.`) : R(winners[0], `Den Stich mitnehmen (${trickPts} Augen) \u2013 mit der kleinsten Karte, die reicht.`);
     }
   }
   const pool = losers.length ? losers : legal;
-  return [...pool].sort((a, b) => pts(a) + power(a) * 0.02 - (pts(b) + power(b) * 0.02))[0];
+  return R([...pool].sort((a, b) => pts(a) + power(a) * 0.02 - (pts(b) + power(b) * 0.02))[0], r === "friend" ? "Der Stich geh\xF6rt vermutlich deiner Partei \u2013 eine kleine Karte reicht." : "Der Stich lohnt sich nicht oder ist nicht zu holen \u2013 billig abwerfen.");
 }
 function wantsDouble(view, persona) {
   const c = view.contract;
@@ -1677,6 +1842,7 @@ var RATE_LIMIT = { windowMs: 2e3, max: 30 };
 var BOT_TIMING = { min: 900, max: 1700, pending: [1400, 2200], first: [1600, 2300], afterReveal: 3800, afterTrick: 1500 };
 function registerSocketHandlers(io, rooms, { pauseMs = DEFAULT_PAUSE_MS, botTiming = BOT_TIMING } = {}) {
   function broadcastState(room) {
+    rooms.recordIfDone(room);
     for (const player of room.players.values()) {
       if (player.socketId) io.to(player.socketId).emit(EVT.ROOM_STATE, room.stateFor(player.id));
     }
@@ -1872,9 +2038,9 @@ function registerSocketHandlers(io, rooms, { pauseMs = DEFAULT_PAUSE_MS, botTimi
   }
   io.on("connection", (socket) => {
     socket.data = {};
-    on(socket, EVT.ROOM_CREATE, ({ name }) => {
+    on(socket, EVT.ROOM_CREATE, ({ name, restore }) => {
       leaveCurrent(socket);
-      const { room, player } = rooms.createRoom(name);
+      const { room, player } = rooms.createRoom(name, restore);
       attach(socket, room, player);
       broadcastState(room);
       return sessionPayload(room, player);
@@ -2048,6 +2214,16 @@ function toItem(id, snippet) {
     thumb: snippet.thumbnails?.high?.url ?? snippet.thumbnails?.medium?.url ?? snippet.thumbnails?.default?.url ?? ""
   };
 }
+var TOPICS = {
+  mix: "deutsch | auf deutsch #shorts",
+  comedy: "comedy deutsch | lustig deutsch #shorts",
+  fussball: "fu\xDFball | bundesliga #shorts",
+  gaming: "gaming deutsch | zocken #shorts",
+  tiere: "tiere lustig | hund | katze #shorts",
+  fails: "fails deutsch | lustige fails #shorts",
+  musik: "musik deutsch | deutschrap #shorts"
+};
+var FOREIGN_SCRIPT = /[\u0400-\u04FF\u0590-\u06FF\u0900-\u0DFF\u0E00-\u0E7F\u3040-\u30FF\u4E00-\u9FFF\uAC00-\uD7AF]/;
 function youtubeRouter() {
   const router = express.Router();
   const cache = /* @__PURE__ */ new Map();
@@ -2066,12 +2242,13 @@ function youtubeRouter() {
   router.get("/api/youtube/trending", async (req, res) => {
     if (!key()) return res.status(503).json({ error: "not_configured" });
     try {
-      const since = new Date(Date.now() - 4 * 24 * 3600 * 1e3);
+      const topic = TOPICS[req.query.topic] ? String(req.query.topic) : "mix";
+      const since = new Date(Date.now() - 7 * 24 * 3600 * 1e3);
       since.setUTCMinutes(0, 0, 0);
       const data = await api("search", {
         part: "snippet",
         type: "video",
-        q: "#shorts",
+        q: TOPICS[topic],
         videoDuration: "short",
         order: "viewCount",
         regionCode: String(req.query.region ?? "DE").slice(0, 2),
@@ -2082,7 +2259,8 @@ function youtubeRouter() {
         ...req.query.page ? { pageToken: String(req.query.page).slice(0, 100) } : {}
       });
       res.json({
-        items: (data.items ?? []).map((v) => toItem(v.id?.videoId, v.snippet)).filter(Boolean),
+        // Titel in fremden Schriften (Devanagari, Arabisch, Kyrillisch, CJK …) aussortieren → deutschsprachiger Feed
+        items: (data.items ?? []).filter((v) => !FOREIGN_SCRIPT.test(`${v.snippet?.title ?? ""} ${v.snippet?.channelTitle ?? ""}`)).map((v) => toItem(v.id?.videoId, v.snippet)).filter(Boolean),
         next: data.nextPageToken ?? null
       });
     } catch (err) {
