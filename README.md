@@ -63,10 +63,23 @@ Mit diesem Schritt gibt es den Knopf **„Mit TikTok anmelden“** – danach er
 Hinweis: Die Anmeldung wird im Server-Speicher gehalten. Wenn der kostenlose Server eingeschlafen ist, einfach erneut anmelden.
 Falls TikTok verlangt, die Domain zu bestätigen (Datei oder Code), sag Bescheid – das baue ich dann ein.
 
+## 6. YouTube Shorts einrichten (optional, einmalig, ca. 5 Minuten)
+
+Ohne diesen Schritt kann man im Videos-Fenster unter „Shorts“ einzelne Shorts per Link abspielen.
+Mit diesem Schritt gibt es zusätzlich den **Trends-Feed** (beliebte Shorts in Deutschland zum Durchwischen) und **Lieblingskanäle**.
+
+1. **console.cloud.google.com** öffnen → mit einem Google-Konto anmelden → oben **„Projekt auswählen“ → „Neues Projekt“** → Name `Luegen` → „Erstellen“.
+2. Links **„APIs & Dienste“ → „Bibliothek“** → nach **„YouTube Data API v3“** suchen → **„Aktivieren“**.
+3. **„APIs & Dienste“ → „Anmeldedaten“ → „Anmeldedaten erstellen“ → „API-Schlüssel“** → Schlüssel kopieren.
+   (Empfohlen: „Schlüssel bearbeiten“ → unter „API-Einschränkungen“ nur „YouTube Data API v3“ erlauben → Speichern.)
+4. Render → Dienst `luegen` → **„Environment“** → „Add Environment Variable“: `YOUTUBE_API_KEY` = dein Schlüssel → **„Save changes“**.
+
+Kostenlos: Das tägliche Gratis-Kontingent reicht locker, weil der Server Ergebnisse 30 Minuten zwischenspeichert.
+
 ## Gut zu wissen
 
 - Der kostenlose Server **schläft nach 15 Minuten** ohne Nutzung ein. Der erste Aufruf danach dauert ca. 1 Minute – danach läuft es normal.
 - **Updates:** Neue Dateien bei GitHub im Repository `luegen` hochladen („Add file“ → „Upload files“, alte werden ersetzt) → Render aktualisiert die App automatisch.
 - **Verbindung weg:** Das Spiel pausiert für alle 10 Sekunden. Wer nicht zurückkommt, fliegt aus der Runde; seine Karten werden zufällig verteilt. Kommt er später zurück, schaut er zu und ist in der nächsten Runde wieder dabei.
-- **TikTok-Fenster:** oben auf das TikTok-Symbol tippen. Fenster an der Titelleiste verschieben, an den Ecken unten größer/kleiner ziehen (oder − / +), mit ▾ zu einem kleinen Symbol einklappen.
+- **Videos-Fenster (TikTok & YouTube Shorts):** oben auf „Videos“ tippen, oben im Fenster zwischen TikTok und Shorts wechseln. Fenster an der Titelleiste verschieben, an den Ecken unten größer/kleiner ziehen (oder − / +), mit ▾ zu einem kleinen Symbol einklappen.
   Den „Für dich“-Feed gibt TikTok für andere Apps nicht frei. Private Konten kann TikTok nicht einbetten.

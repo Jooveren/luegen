@@ -3,7 +3,7 @@ import path2 from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 
 // src/app.js
-import express2 from "express";
+import express3 from "express";
 import { createServer } from "node:http";
 import { existsSync } from "node:fs";
 import path from "node:path";
@@ -48,6 +48,7 @@ var EVT = {
   GAME_ACCEPT: "game:accept",
   GAME_REMATCH: "game:rematch",
   CHAT_SEND: "chat:send",
+  LOBBY_LIST: "lobby:list",
   // Server → Client
   ROOM_STATE: "room:state",
   GAME_EVENT: "game:event",
@@ -378,7 +379,7 @@ var Room = class {
     this.code = code;
     this.hostId = null;
     this.players = /* @__PURE__ */ new Map();
-    this.settings = { mode: MODES.SAME };
+    this.settings = { mode: MODES.SAME, public: true };
     this.game = null;
     this.chat = [];
     this.pauses = /* @__PURE__ */ new Map();
@@ -478,10 +479,21 @@ var RoomManager = class {
   updateSettings(room, playerId, settings) {
     this.#assertHost(room, playerId);
     if (room.phase !== PHASES.LOBBY) throw new GameError("ALREADY_STARTED", "Nur in der Lobby \xE4nderbar.");
+    if (settings?.public !== void 0) room.settings.public = Boolean(settings.public);
     if (settings?.mode !== void 0) {
       if (!Object.values(MODES).includes(settings.mode)) throw new GameError("BAD_MODE", "Unbekannter Modus.");
       room.settings.mode = settings.mode;
     }
+  }
+  /** Öffentliche Tische, die noch auf Mitspieler warten. */
+  listOpenRooms() {
+    return [...this.rooms.values()].filter((r) => r.phase === PHASES.LOBBY && r.settings.public && r.players.size > 0 && r.players.size < MAX_PLAYERS).map((r) => ({
+      code: r.code,
+      host: r.players.get(r.hostId)?.name ?? "?",
+      players: r.players.size,
+      max: MAX_PLAYERS,
+      mode: r.settings.mode
+    })).slice(0, 50);
   }
   startGame(room, playerId) {
     this.#assertHost(room, playerId);
@@ -620,6 +632,7 @@ function registerSocketHandlers(io, rooms, { pauseMs = DEFAULT_PAUSE_MS } = {}) 
       broadcastState(room);
       return sessionPayload(room, player);
     });
+    on(socket, EVT.LOBBY_LIST, () => ({ rooms: rooms.listOpenRooms() }));
     on(socket, EVT.ROOM_LEAVE, () => {
       leaveCurrent(socket);
       return {};
@@ -774,11 +787,11 @@ function tiktokRouter() {
   const sessions = /* @__PURE__ */ new Map();
   const configured = () => Boolean(config().key && config().secret);
   async function tokenRequest(params) {
-    const { key, secret } = config();
+    const { key: key2, secret } = config();
     const res = await fetch(TOKEN_URL, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded", "Cache-Control": "no-cache" },
-      body: new URLSearchParams({ client_key: key, client_secret: secret, ...params })
+      body: new URLSearchParams({ client_key: key2, client_secret: secret, ...params })
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok || !data.access_token) throw new Error(data.error_description || data.error || `Token-Fehler (${res.status})`);
@@ -865,11 +878,90 @@ function tiktokRouter() {
   return router;
 }
 
+// src/youtube.js
+import express2 from "express";
+var API = "https://www.googleapis.com/youtube/v3";
+var TTL = 30 * 60 * 1e3;
+var key = () => process.env.YOUTUBE_API_KEY?.trim();
+function toItem(id, snippet) {
+  if (!id || !snippet) return null;
+  return {
+    id,
+    title: snippet.title ?? "",
+    channel: snippet.channelTitle ?? snippet.videoOwnerChannelTitle ?? "",
+    thumb: snippet.thumbnails?.high?.url ?? snippet.thumbnails?.medium?.url ?? snippet.thumbnails?.default?.url ?? ""
+  };
+}
+function youtubeRouter() {
+  const router = express2.Router();
+  const cache = /* @__PURE__ */ new Map();
+  async function api(path3, params) {
+    const url = `${API}/${path3}?${new URLSearchParams({ ...params, key: key() })}`;
+    const hit = cache.get(url);
+    if (hit && Date.now() - hit.at < TTL) return hit.data;
+    const res = await fetch(url);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data?.error?.message ?? `YouTube-Fehler (${res.status})`);
+    cache.set(url, { at: Date.now(), data });
+    if (cache.size > 300) cache.delete(cache.keys().next().value);
+    return data;
+  }
+  router.get("/api/youtube/status", (_req, res) => res.json({ configured: Boolean(key()) }));
+  router.get("/api/youtube/trending", async (req, res) => {
+    if (!key()) return res.status(503).json({ error: "not_configured" });
+    try {
+      const since = new Date(Date.now() - 4 * 24 * 3600 * 1e3);
+      since.setUTCMinutes(0, 0, 0);
+      const data = await api("search", {
+        part: "snippet",
+        type: "video",
+        q: "#shorts",
+        videoDuration: "short",
+        order: "viewCount",
+        regionCode: String(req.query.region ?? "DE").slice(0, 2),
+        relevanceLanguage: "de",
+        safeSearch: "moderate",
+        publishedAfter: since.toISOString(),
+        maxResults: "25",
+        ...req.query.page ? { pageToken: String(req.query.page).slice(0, 100) } : {}
+      });
+      res.json({
+        items: (data.items ?? []).map((v) => toItem(v.id?.videoId, v.snippet)).filter(Boolean),
+        next: data.nextPageToken ?? null
+      });
+    } catch (err) {
+      res.status(502).json({ error: err.message });
+    }
+  });
+  router.get("/api/youtube/channel", async (req, res) => {
+    if (!key()) return res.status(503).json({ error: "not_configured" });
+    const handle = String(req.query.handle ?? "").trim().replace(/^@?/, "@");
+    if (!/^@[A-Za-z0-9._-]{2,40}$/.test(handle)) return res.status(400).json({ error: "Ung\xFCltiger Kanalname" });
+    try {
+      const ch = await api("channels", { part: "snippet", forHandle: handle });
+      const channel = ch.items?.[0];
+      if (!channel) return res.status(404).json({ error: "Kanal nicht gefunden" });
+      const shortsPlaylist = `UUSH${channel.id.slice(2)}`;
+      let items = [];
+      try {
+        const pl = await api("playlistItems", { part: "snippet", playlistId: shortsPlaylist, maxResults: "30" });
+        items = (pl.items ?? []).map((v) => toItem(v.snippet?.resourceId?.videoId, v.snippet)).filter(Boolean);
+      } catch {
+        items = [];
+      }
+      res.json({ channel: { id: channel.id, title: channel.snippet?.title ?? handle, handle }, items });
+    } catch (err) {
+      res.status(502).json({ error: err.message });
+    }
+  });
+  return router;
+}
+
 // src/app.js
 var __dirname = path.dirname(fileURLToPath(import.meta.url));
 var CLIENT_ORIGIN = process.env.CLIENT_ORIGIN?.split(",").map((s) => s.trim());
 function createLuegenServer({ clientDir, pauseMs } = {}) {
-  const app = express2();
+  const app = express3();
   const httpServer2 = createServer(app);
   const io = new Server(httpServer2, {
     cors: { origin: CLIENT_ORIGIN ?? true },
@@ -882,6 +974,7 @@ function createLuegenServer({ clientDir, pauseMs } = {}) {
   registerSocketHandlers(io, rooms, { pauseMs });
   app.set("trust proxy", true);
   app.use(tiktokRouter());
+  app.use(youtubeRouter());
   app.get("/health", (_req, res) => res.json({ ok: true, rooms: rooms.rooms.size }));
   if (clientDir) {
     const PUBLIC = ["manifest.webmanifest", "icon-192.png", "icon-512.png", "favicon.svg"];
@@ -891,7 +984,7 @@ function createLuegenServer({ clientDir, pauseMs } = {}) {
   }
   const clientDist = path.resolve(__dirname, "../../client/dist");
   if (existsSync(clientDist)) {
-    app.use(express2.static(clientDist, { maxAge: "1h", index: false }));
+    app.use(express3.static(clientDist, { maxAge: "1h", index: false }));
     app.get(/^(?!\/socket\.io).*/, (_req, res) => res.sendFile(path.join(clientDist, "index.html")));
   }
   return { app, httpServer: httpServer2, io, rooms };
