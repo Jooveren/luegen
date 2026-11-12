@@ -1,6 +1,6 @@
 # Lügen online stellen – geht auch komplett am Tablet
 
-Dieses Paket enthält das fertige Spiel: online mit Freunden (mit Chat), gegen den Computer und ein TikTok-Fenster.
+Dieses Paket enthält das fertige Spiel: Lügen und Schafkopf, online mit Freunden (mit Chat), gegen den Computer und ein Fenster mit YouTube Shorts.
 Alle Dateien liegen ohne Unterordner – so lassen sie sich direkt im Browser hochladen.
 
 Dateien: `index.html`, `server.js`, `package.json`, `render.yaml`, `manifest.webmanifest`, `icon-192.png`, `icon-512.png`, `favicon.svg`, `README.md`
@@ -35,35 +35,7 @@ Dateien: `index.html`, `server.js`, `package.json`, `render.yaml`, `manifest.web
   iPad/iPhone (Safari): Teilen-Symbol → „Zum Home-Bildschirm“.
   Android (Chrome): ⋮ → „App installieren“ / „Zum Startbildschirm hinzufügen“.
 
-## 5. Echte TikTok-Anmeldung einrichten (optional, einmalig)
-
-Ohne diesen Schritt kann man im TikTok-Fenster seinen TikTok-**Namen** verknüpfen und Video-Links abspielen.
-Mit diesem Schritt gibt es den Knopf **„Mit TikTok anmelden“** – danach erscheinen dein Profil und deine eigenen Videos.
-
-1. **developers.tiktok.com** öffnen → mit deinem TikTok-Konto anmelden → falls gefragt, Entwicklerkonto anlegen.
-2. **„Manage apps“ → „Connect an app“** (bzw. „Create app“). Angaben:
-   - Name: `Lügen`, Icon: `icon-512.png` aus diesem Paket, Kategorie: Games/Entertainment, kurze Beschreibung
-   - Terms of Service URL: `https://DEIN-LINK/nutzungsbedingungen`
-   - Privacy Policy URL: `https://DEIN-LINK/datenschutz`
-   - Plattform: **Web**, Website: `https://DEIN-LINK`
-   (`DEIN-LINK` = deine Render-Adresse, z. B. `luegen-xxxx.onrender.com` – die beiden Seiten gibt es dort schon.)
-3. **„Add products“ → „Login Kit“** → bei **Redirect URI** eintragen: `https://DEIN-LINK/auth/tiktok/callback`
-4. Zusätzlich **„Display API“** hinzufügen. Berechtigungen (Scopes): `user.info.basic` und `video.list`.
-5. **Sandbox** einschalten (Schalter/Reiter „Sandbox“ → „Create sandbox“) und unter **„Target users“** dein TikTok-Konto
-   (und die deiner Freunde) hinzufügen. So funktioniert die Anmeldung sofort, ohne dass TikTok die App erst prüfen muss.
-   Für alle anderen Nutzer: später „Submit for review“.
-6. **Client key** und **Client secret** kopieren → bei Render deinen Dienst `luegen` öffnen → **„Environment“** →
-   „Add Environment Variable“:
-   - `TIKTOK_CLIENT_KEY` = dein Client key
-   - `TIKTOK_CLIENT_SECRET` = dein Client secret
-
-   → **„Save changes“**. Render startet die App neu (1–2 Minuten).
-7. In der App: TikTok-Symbol → **„Mit TikTok anmelden“**.
-
-Hinweis: Die Anmeldung wird im Server-Speicher gehalten. Wenn der kostenlose Server eingeschlafen ist, einfach erneut anmelden.
-Falls TikTok verlangt, die Domain zu bestätigen (Datei oder Code), sag Bescheid – das baue ich dann ein.
-
-## 6. YouTube Shorts einrichten (optional, einmalig, ca. 5 Minuten)
+## 5. YouTube Shorts einrichten (optional, einmalig, ca. 5 Minuten)
 
 Ohne diesen Schritt kann man im Videos-Fenster unter „Shorts“ einzelne Shorts per Link abspielen.
 Mit diesem Schritt gibt es zusätzlich den **Trends-Feed** (beliebte Shorts in Deutschland zum Durchwischen) und **Lieblingskanäle**.
@@ -81,5 +53,4 @@ Kostenlos: Das tägliche Gratis-Kontingent reicht locker, weil der Server Ergebn
 - Der kostenlose Server **schläft nach 15 Minuten** ohne Nutzung ein. Der erste Aufruf danach dauert ca. 1 Minute – danach läuft es normal.
 - **Updates:** Neue Dateien bei GitHub im Repository `luegen` hochladen („Add file“ → „Upload files“, alte werden ersetzt) → Render aktualisiert die App automatisch.
 - **Verbindung weg:** Das Spiel pausiert für alle 10 Sekunden. Wer nicht zurückkommt, fliegt aus der Runde; seine Karten werden zufällig verteilt. Kommt er später zurück, schaut er zu und ist in der nächsten Runde wieder dabei.
-- **Videos-Fenster (TikTok & YouTube Shorts):** oben auf „Videos“ tippen, oben im Fenster zwischen TikTok und Shorts wechseln. Fenster an der Titelleiste verschieben, an den Ecken unten größer/kleiner ziehen (oder − / +), mit ▾ zu einem kleinen Symbol einklappen.
-  Den „Für dich“-Feed gibt TikTok für andere Apps nicht frei. Private Konten kann TikTok nicht einbetten.
+- **Videos-Fenster (YouTube Shorts):** oben auf „Videos“ tippen. Fenster an der Titelleiste verschieben, an den Ecken unten größer/kleiner ziehen (oder − / +), mit ▾ zu einem kleinen Symbol einklappen.
