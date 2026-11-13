@@ -48,6 +48,17 @@ Mit diesem Schritt gibt es zusätzlich den **Trends-Feed** (beliebte Shorts in D
 
 Kostenlos: Das tägliche Gratis-Kontingent reicht locker, weil der Server Ergebnisse 30 Minuten zwischenspeichert.
 
+## 6. Taler-Konten dauerhaft speichern (wichtig, einmalig, ca. 5 Minuten)
+
+Ohne Datenbank löscht der kostenlose Render-Server alle Konten bei jedem Neustart/Update. Kostenlose Datenbank bei Neon (kein Ablaufdatum, keine Kreditkarte):
+
+1. **neon.com** öffnen → **„Sign up“** (z. B. mit GitHub) → neues Projekt anlegen, Name `games`, Region **Frankfurt (eu-central-1)**.
+2. Im Projekt auf **„Connect“** → die Verbindungs-Adresse kopieren (beginnt mit `postgresql://…` und endet mit `?sslmode=require`).
+3. Render → Dienst `luegen` → **„Environment“** → „Add Environment Variable“: `DATABASE_URL` = die kopierte Adresse → **„Save changes“**.
+4. Render startet neu. In den Logs steht dann `[wallet] Konten: Datenbank`. Die Tabellen legt der Server selbst an.
+
+Taler sind reines Spielgeld: kein Einzahlen, keine Auszahlung. Start 500 Taler, jeden Tag +50 (wer unter 100 fällt, wird auf 100 aufgefüllt).
+
 ## Gut zu wissen
 
 - Der kostenlose Server **schläft nach 15 Minuten** ohne Nutzung ein. Der erste Aufruf danach dauert ca. 1 Minute – danach läuft es normal.

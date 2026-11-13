@@ -1,12 +1,12 @@
 // src/deploy-entry.js
-import path2 from "node:path";
+import path3 from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 
 // src/app.js
 import express2 from "express";
 import { createServer } from "node:http";
-import { existsSync } from "node:fs";
-import path from "node:path";
+import { existsSync as existsSync2 } from "node:fs";
+import path2 from "node:path";
 import { fileURLToPath } from "node:url";
 import { Server } from "socket.io";
 
@@ -25,6 +25,27 @@ var POKER_CHIPS = [500, 1e3, 2e3, 5e3];
 var POKER_BLINDS = ["5/10", "10/20", "25/50", "50/100"];
 var TURN_SECONDS = [15, 30, 60, 0];
 var BJ_DECKS = [1, 2, 6, 8];
+var WALLET = { start: 500, daily: 50, floor: 100, pinMin: 4, pinMax: 8 };
+var STAKE_LEVELS = {
+  luegen: [5, 10, 20, 50],
+  schafkopf: [5, 10, 20, 50],
+  chess: [10, 25, 50, 100],
+  poker: [100, 200, 500, 1e3],
+  blackjack: [50, 100, 200, 500]
+};
+var SK_TARIF_BASE = 10;
+var stakeOf = (settings) => STAKE_LEVELS[settings.game]?.[settings.stakeLevel ?? 1] ?? 0;
+function minBalanceFor(settings, players = 2) {
+  const s = stakeOf(settings);
+  if (settings.game === "luegen") return s * Math.max(1, players - 1);
+  if (settings.game === "schafkopf") return s * 10;
+  return s;
+}
+function walletBlinds(buyIn) {
+  const bb = Math.max(2, Math.round(buyIn / 50));
+  return { sb: Math.max(1, Math.floor(bb / 2)), bb };
+}
+var fmtTaler = (n) => `${Math.round(n ?? 0).toLocaleString("de-DE")} Taler`;
 var UNCLAIMABLE_RANK = "O";
 var CLAIM_RANKS = RANKS.filter((r) => r !== UNCLAIMABLE_RANK);
 var MAX_CARDS_PER_PLAY = 3;
@@ -84,14 +105,25 @@ var EVT = {
   // wer ist gerade online
   INVITE_SEND: "invite:send",
   // Leute an meinen Tisch einladen
+  ACC_REGISTER: "acc:register",
+  // Konto anlegen (Name + PIN)
+  ACC_LOGIN: "acc:login",
+  ACC_RESUME: "acc:resume",
+  // gespeicherte Sitzung fortsetzen
+  ACC_LOGOUT: "acc:logout",
+  ACC_HISTORY: "acc:history",
+  CASINO_REBUY: "casino:rebuy",
+  // Taler-Tisch: Chips nachkaufen
   // Server → Client
   ROOM_STATE: "room:state",
   GAME_EVENT: "game:event",
   KICKED: "room:kicked",
   CHAT_MESSAGE: "chat:message",
   CHAT_HISTORY: "chat:history",
-  INVITE: "invite"
+  INVITE: "invite",
   // Einladung an diesen Client
+  ACC_BALANCE: "acc:balance"
+  // neuer Kontostand
 };
 function nextRank(rank) {
   const i = RANKS.indexOf(rank);
@@ -2307,6 +2339,7 @@ var PokerGame = class {
     for (const id of this.order) {
       if (this.stacks[id] > 0 || this.eliminated.includes(id)) continue;
       if (this.mode === "cash") {
+        if (this.opts.rebuy === false) continue;
         this.stacks[id] = this.opts.startChips;
         this.buyins[id] += 1;
       } else this.eliminated.push(id);
@@ -2579,6 +2612,16 @@ var PokerGame = class {
     if (!o) return null;
     return this.act(id, { type: o.canCheck ? "check" : "fold" });
   }
+  /** Taler-Tisch: pleite Spieler kauft nach (wirkt ab der nächsten Hand). */
+  rebuy(id, amount) {
+    if (!this.order.includes(id) || this.eliminated.includes(id)) throw new PokerError("NOT_SEATED", "Du sitzt nicht am Tisch.");
+    if (this.mode !== "cash") throw new PokerError("NO_REBUY", "Im Turnier gibt es kein Nachkaufen.");
+    if (this.stacks[id] > 0) throw new PokerError("NOT_BROKE", "Du hast noch Chips.");
+    this.stacks[id] = amount;
+    this.buyins[id] += 1;
+    this.seq++;
+    return { type: "poker_rebuy", playerId: id, amount };
+  }
   /** Spieler verlässt den Tisch: Karten weg, Chips bleiben verloren. */
   removePlayer(id) {
     if (!this.order.includes(id)) return null;
@@ -2592,6 +2635,7 @@ var PokerGame = class {
         if (alive.length === 1) ev = this.#award(true);
       }
     }
+    this.lastCashout = { id, amount: this.stacks[id] };
     this.stacks[id] = 0;
     if (!this.eliminated.includes(id)) this.eliminated.push(id);
     this.seq++;
@@ -2710,7 +2754,7 @@ var BlackjackGame = class {
   startBetting() {
     if (this.shoe.length <= this.cut) this.#newShoe();
     for (const id of this.order) {
-      if (this.chips[id] < this.opts.minBet) {
+      if (this.opts.refill !== false && this.chips[id] < this.opts.minBet) {
         this.chips[id] = this.opts.startChips;
         this.refills[id] += 1;
       }
@@ -2973,6 +3017,16 @@ var BlackjackGame = class {
     if (this.phase === "playing" && this.active) return [this.active.id];
     return [];
   }
+  /** Taler-Tisch: Chips nachkaufen (nur zwischen den Runden). */
+  rebuy(id, amount) {
+    if (!this.order.includes(id)) throw new BlackjackError("NOT_SEATED", "Du sitzt nicht am Tisch.");
+    if (this.phase !== "betting" || this.ready.has(id)) throw new BlackjackError("NOT_NOW", "Nachkaufen geht nur vor dem Setzen.");
+    if (this.chips[id] >= this.opts.minBet) throw new BlackjackError("NOT_BROKE", "Du hast noch genug Chips.");
+    this.chips[id] += amount;
+    this.refills[id] += 1;
+    this.seq++;
+    return { type: "bj_rebuy", playerId: id, amount };
+  }
   addPlayer(id) {
     if (this.order.length >= BJ_MAX_SEATS || this.order.includes(id)) return;
     this.order.push(id);
@@ -3055,6 +3109,131 @@ var BlackjackGame = class {
   }
 };
 
+// src/rooms/stakes.js
+var isWallet = (room) => room.settings.stakes === "wallet";
+var acc = (room, id) => room.players.get(id)?.accountId ?? room.walletAccounts?.get(id) ?? null;
+function escrowFor(room) {
+  const s = stakeOf(room.settings);
+  const game = room.settings.game;
+  if (!["chess", "poker", "blackjack"].includes(game)) return [];
+  const label = game === "chess" ? "Einsatz Schach" : game === "blackjack" ? "Buy-in Blackjack" : room.settings.pokerMode === "tournament" ? "Buy-in Poker-Turnier" : "Buy-in Poker";
+  return room.humans.map((p) => ({ playerId: p.id, accountId: p.accountId, amount: s, reason: label }));
+}
+function prizeShares(n) {
+  if (n <= 2) return [1];
+  if (n < 6) return [0.65, 0.35];
+  return [0.5, 0.3, 0.2];
+}
+function casinoCashout(room, ids, reason) {
+  const g = room.game;
+  const chips = g.kind === "poker" ? g.stacks : g.chips;
+  const entries = ids.map((id) => ({ playerId: id, accountId: acc(room, id), amount: Math.max(0, Math.round(chips[id] ?? 0)), reason })).filter((e) => e.accountId);
+  return { kind: "payout", entries, release: entries.map((e) => e.accountId) };
+}
+function tournamentChop(room) {
+  const g = room.game;
+  const pool = room.walletPool ?? 0;
+  const live = g.order.filter((id) => g.stacks[id] > 0);
+  const total = live.reduce((s, id) => s + g.stacks[id], 0) || 1;
+  let given = 0;
+  const entries = live.map((id) => {
+    const amount = Math.floor(pool * g.stacks[id] / total);
+    given += amount;
+    return { playerId: id, accountId: acc(room, id), amount, reason: "Turnier abgebrochen \u2013 Aufteilung" };
+  });
+  if (entries.length && pool - given > 0) entries[0].amount += pool - given;
+  return { kind: "payout", entries: entries.filter((e) => e.accountId), release: "all" };
+}
+function leaveOps(room, playerId) {
+  const g = room.game;
+  if (!g || !isWallet(room)) return [];
+  const accountId = acc(room, playerId);
+  if (!accountId) return [];
+  const s = stakeOf(room.settings);
+  if (g.kind === "poker") return [];
+  if (g.kind === "blackjack" && !room.walletClosed) return [casinoCashout(room, [playerId], "Auszahlung Blackjack")];
+  if (g.kind === "luegen" && g.phase === "playing" && g.order.includes(playerId)) {
+    const others = g.order.filter((id) => id !== playerId && acc(room, id));
+    room.walletGameIds = (room.walletGameIds ?? []).filter((id) => id !== playerId);
+    return [{ kind: "settle", reason: "L\xFCgen \u2013 Spiel verlassen", entries: [{ playerId, accountId, delta: -s * others.length }, ...others.map((id) => ({ playerId: id, accountId: acc(room, id), delta: s }))] }];
+  }
+  if (g.kind === "schafkopf" && g.order.includes(playerId) && !["scored"].includes(g.phase)) {
+    const others = g.order.filter((id) => id !== playerId && acc(room, id));
+    return [{ kind: "settle", reason: "Schafkopf \u2013 Spiel abgebrochen", entries: [{ playerId, accountId, delta: -s * others.length }, ...others.map((id) => ({ playerId: id, accountId: acc(room, id), delta: s }))] }];
+  }
+  return [];
+}
+function pokerLeaveOps(room, playerId) {
+  const g = room.game;
+  if (g?.kind !== "poker" || g.mode !== "cash" || !isWallet(room) || room.walletClosed) return [];
+  const accountId = acc(room, playerId);
+  if (!accountId || g.lastCashout?.id !== playerId) return [];
+  return [{ kind: "payout", entries: [{ playerId, accountId, amount: Math.max(0, g.lastCashout.amount), reason: "Auszahlung Poker" }], release: [accountId] }];
+}
+function endOps(room) {
+  const g = room.game;
+  if (!g || !isWallet(room)) return [];
+  const s = stakeOf(room.settings);
+  const label = GAME_LABELS[g.kind] ?? "Spiel";
+  if (g.kind === "luegen") {
+    if (g.phase !== "finished" || g.walletDone || !g.loserId) return [];
+    g.walletDone = true;
+    const ids = (room.walletGameIds ?? g.order).filter((id) => id !== g.loserId && acc(room, id));
+    if (!acc(room, g.loserId)) return [];
+    return [{ kind: "settle", reason: "L\xFCgen", entries: [{ playerId: g.loserId, accountId: acc(room, g.loserId), delta: -s * ids.length }, ...ids.map((id) => ({ playerId: id, accountId: acc(room, id), delta: s }))] }];
+  }
+  if (g.kind === "schafkopf") {
+    if (g.phase !== "scored" || g.walletRound === g.round || !g.result) return [];
+    g.walletRound = g.round;
+    const r = g.result;
+    if (r.type === "thrown" || r.type === "aborted" || !r.payout) return [];
+    const f = s / SK_TARIF_BASE;
+    return [{ kind: "settle", reason: "Schafkopf", entries: Object.entries(r.payout).map(([id, cents]) => ({ playerId: id, accountId: acc(room, id), delta: Math.round(cents * f) })) }];
+  }
+  if (g.kind === "chess") {
+    if (g.phase !== "over" || g.walletDone) return [];
+    g.walletDone = true;
+    const w = g.result?.winner;
+    if (w) return [{ kind: "payout", entries: [{ playerId: w, accountId: acc(room, w), amount: s * 2, reason: "Gewinn Schach" }], release: "all" }];
+    return [{ kind: "payout", entries: g.order.map((id) => ({ playerId: id, accountId: acc(room, id), amount: s, reason: g.result?.result === "*" ? "Schach abgebrochen \u2013 zur\xFCck" : "Remis \u2013 Einsatz zur\xFCck" })), release: "all" }];
+  }
+  if (g.kind === "poker" && g.phase === "over" && !room.walletClosed) {
+    room.walletClosed = true;
+    if (g.mode === "cash") return [casinoCashout(room, g.order.filter((id) => acc(room, id)), "Auszahlung Poker")];
+    const pool = room.walletPool ?? 0;
+    const places = [g.winnerId, ...[...g.eliminated].reverse()].filter(Boolean);
+    const shares = prizeShares(room.walletEntrants ?? places.length);
+    let given = 0;
+    const entries = shares.map((sh, i) => {
+      const id = places[i];
+      const amount = Math.floor(pool * sh);
+      given += amount;
+      return id && { playerId: id, accountId: acc(room, id), amount, reason: `Poker-Turnier \u2013 Platz ${i + 1}` };
+    }).filter(Boolean);
+    if (entries.length && pool - given > 0) entries[0].amount += pool - given;
+    return [{ kind: "payout", entries: entries.filter((e) => e.accountId), release: "all" }];
+  }
+  return [];
+}
+function closeOps(room) {
+  const g = room.game;
+  if (!g || !isWallet(room) || room.walletClosed) return [];
+  if (g.kind === "poker") {
+    room.walletClosed = true;
+    if (g.mode === "cash") return [casinoCashout(room, g.order.filter((id) => acc(room, id) && room.players.has(id)), "Auszahlung Poker")];
+    return [tournamentChop(room)];
+  }
+  if (g.kind === "blackjack") {
+    room.walletClosed = true;
+    return [casinoCashout(room, g.order.filter((id) => acc(room, id) && room.players.has(id)), "Auszahlung Blackjack")];
+  }
+  if (g.kind === "chess" && g.phase !== "over" && !g.walletDone) {
+    g.walletDone = true;
+    return [{ kind: "payout", entries: g.order.map((id) => ({ playerId: id, accountId: acc(room, id), amount: stakeOf(room.settings), reason: "Schach abgebrochen \u2013 zur\xFCck" })), release: "all" }];
+  }
+  return [];
+}
+
 // src/rooms/RoomManager.js
 var CASINO = /* @__PURE__ */ new Set(["poker", "blackjack"]);
 var POKER_STYLE_ORDER = ["tight", "aggro", "loose", "bluffer"];
@@ -3075,7 +3254,9 @@ var Room = class {
     this.code = code;
     this.hostId = null;
     this.players = /* @__PURE__ */ new Map();
-    this.settings = { mode: MODES.SAME, public: true, game: GAMES.LUEGEN, skVariant: "lang", skPass: "ramsch", skExtras: defaultExtras(), chessTime: "5+0", chessColor: "random", pokerMode: "cash", pokerChips: 1e3, pokerBlinds: "5/10", turnSec: 30, bjDecks: 6, bjH17: false, bjPays: "3:2", bjSurrender: true };
+    this.settings = { mode: MODES.SAME, public: true, game: GAMES.LUEGEN, skVariant: "lang", skPass: "ramsch", skExtras: defaultExtras(), chessTime: "5+0", chessColor: "random", pokerMode: "cash", pokerChips: 1e3, pokerBlinds: "5/10", turnSec: 30, bjDecks: 6, bjH17: false, bjPays: "3:2", bjSurrender: true, stakes: "free", stakeLevel: 1 };
+    this.walletOps = [];
+    this.walletAccounts = /* @__PURE__ */ new Map();
     this.chessWhite = null;
     this.ready = /* @__PURE__ */ new Set();
     this.scores = new ScoreBook();
@@ -3142,7 +3323,9 @@ var Room = class {
         character: p.character,
         ...p.photo && { photo: p.photoV },
         ...p.bot && { bot: true, difficulty: p.difficulty },
-        ...p.autoplay && { autoplay: true }
+        ...p.autoplay && { autoplay: true },
+        ...p.accountId && { account: true },
+        ...p.accountId && this.balances?.has(p.accountId) && { balance: this.balances.get(p.accountId) }
       })),
       ready: [...this.ready],
       scores: this.scores.toJSON(80),
@@ -3155,8 +3338,17 @@ var Room = class {
   }
 };
 var RoomManager = class {
-  constructor() {
+  constructor({ wallet = null } = {}) {
     this.rooms = /* @__PURE__ */ new Map();
+    this.wallet = wallet;
+  }
+  /** Buchungsaufträge für den Handler vormerken. */
+  #queue(room, ops) {
+    if (ops?.length) room.walletOps.push(...ops);
+  }
+  #unlockAll(room) {
+    if (!this.wallet) return;
+    for (const p of room.players.values()) if (p.accountId) this.wallet.unlock(p.accountId, room.code);
   }
   #generateCode() {
     for (let attempt = 0; attempt < 1e3; attempt++) {
@@ -3166,10 +3358,16 @@ var RoomManager = class {
     }
     throw new GameError("NO_CODE", "Gerade sind zu viele R\xE4ume offen. Bitte sp\xE4ter erneut versuchen.");
   }
-  #addPlayer(room, name) {
+  #addPlayer(room, name, account = null) {
+    if (isWallet(room)) {
+      if (!account) throw new GameError("NEED_ACCOUNT", "An diesem Tisch wird um Taler gespielt \u2013 bitte erst anmelden.");
+      if ([...room.players.values()].some((p) => p.accountId === account.id)) throw new GameError("ALREADY_SEATED", "Du sitzt schon an diesem Tisch.");
+      this.wallet?.lock(account.id, room.code);
+    }
     const player = {
       id: newId(),
-      name: room.uniqueName(sanitizeName(name)),
+      accountId: account?.id ?? null,
+      name: room.uniqueName(sanitizeName(account?.name ?? name)),
       token: newToken(),
       socketId: null,
       connected: false,
@@ -3178,6 +3376,7 @@ var RoomManager = class {
     };
     room.players.set(player.id, player);
     room.names.set(player.id, player.name);
+    if (player.accountId) room.walletAccounts.set(player.id, player.accountId);
     room.scores.ensure(player.name);
     if (!room.hostId) room.hostId = player.id;
     return player;
@@ -3205,13 +3404,13 @@ var RoomManager = class {
     return room;
   }
   /** Neuer Tisch – optional aus einem gespeicherten Tisch (Regeln, Computer-Gegner, Kasse). */
-  createRoom(name, restore, settings) {
+  createRoom(name, restore, settings, account = null) {
     const room = new Room(this.#generateCode());
     this.rooms.set(room.code, room);
     if (restore && typeof restore === "object") room.scores = new ScoreBook(restore.scores);
     let player;
     try {
-      player = this.#addPlayer(room, name);
+      player = this.#addPlayer(room, name, account);
     } catch (err) {
       this.rooms.delete(room.code);
       throw err;
@@ -3257,11 +3456,11 @@ var RoomManager = class {
     const reason = { ober: "vier Ober", ober_patt: "Ober-Patt", most_cards: "die meisten Karten" }[g.endReason];
     return room.scores.record({ game: "luegen", label: `L\xFCgen \u2013 ${loser} verliert${reason ? ` (${reason})` : ""}`, deltas: luegenDeltas(names, loser) });
   }
-  joinRoom(code, name) {
+  joinRoom(code, name, account = null) {
     const room = this.getRoom(code);
     if (room.phase !== PHASES.LOBBY) throw new GameError("ALREADY_STARTED", "Das Spiel l\xE4uft bereits.");
     if (room.players.size >= room.maxPlayers) throw new GameError("ROOM_FULL", `Raum ist voll (max. ${room.maxPlayers}).`);
-    const player = this.#addPlayer(room, name);
+    const player = this.#addPlayer(room, name, account);
     return { room, player };
   }
   rejoin(code, token) {
@@ -3279,20 +3478,32 @@ var RoomManager = class {
     let event = null;
     room.pauses.delete(playerId);
     room.ready.delete(playerId);
-    if (room.game?.kind === "schafkopf" && room.game.order.includes(playerId) && room.humans.length > 0) {
+    const walletLeave = isWallet(room) && room.game ? leaveOps(room, playerId) : [];
+    this.#queue(room, walletLeave);
+    if (player.accountId) this.wallet?.unlock(player.accountId, room.code);
+    if (isWallet(room) && room.game?.kind === "schafkopf" && room.game.order.includes(playerId) && room.game.phase !== "scored") {
+      room.game = null;
+      event = { type: "sk_aborted", playerId, name: player.name };
+    } else if (isWallet(room) && room.game?.kind === "schafkopf") {
+      room.game = null;
+    } else if (room.game?.kind === "schafkopf" && room.game.order.includes(playerId) && room.humans.length > 0) {
       const bot = this.#createBot(room, "normal");
       room.game.replacePlayer(playerId, bot.id);
       room.personas[bot.id] = makePersona(bot.base, bot.difficulty);
       event = { type: "replaced", playerId, botId: bot.id, name: player.name, botName: bot.name };
     } else if (room.game?.kind === "chess") event = room.game.abandon(playerId);
-    else if (CASINO.has(room.game?.kind)) event = room.game.removePlayer(playerId);
-    else if (room.game && room.game.phase === PHASES.PLAYING && room.game.kind !== "schafkopf") event = room.game.removePlayer(playerId);
+    else if (CASINO.has(room.game?.kind)) {
+      event = room.game.removePlayer(playerId);
+      this.#queue(room, pokerLeaveOps(room, playerId));
+    } else if (room.game && room.game.phase === PHASES.PLAYING && room.game.kind !== "schafkopf") event = room.game.removePlayer(playerId);
     if (room.hostId === playerId) {
       const humans = room.humans;
       const nextHost = humans.find((p) => p.connected) ?? humans[0];
       room.hostId = nextHost?.id ?? null;
     }
     if (room.humans.length === 0) {
+      this.#queue(room, closeOps(room));
+      this.#unlockAll(room);
       clearTimeout(room.botTimer);
       room.players.clear();
       this.rooms.delete(room.code);
@@ -3304,6 +3515,7 @@ var RoomManager = class {
     this.#assertHost(room, playerId);
     if (room.phase !== PHASES.LOBBY) throw new GameError("ALREADY_STARTED", "Nur in der Lobby m\xF6glich.");
     if (room.settings.game === GAMES.CHESS) throw new GameError("NO_BOTS", "Gegen den Computer spielst du Schach \xFCber \u201EGegen Computer\u201C.");
+    if (isWallet(room)) throw new GameError("NO_BOTS", "Um Taler spielen nur echte Mitspieler \u2013 keine Computer.");
     if (room.players.size >= room.maxPlayers) throw new GameError("ROOM_FULL", `Raum ist voll (max. ${room.maxPlayers}).`);
     return this.#createBot(room, difficulty);
   }
@@ -3400,6 +3612,33 @@ var RoomManager = class {
       if (!Object.values(MODES).includes(settings.mode)) throw new GameError("BAD_MODE", "Unbekannter Modus.");
       room.settings.mode = settings.mode;
     }
+    if (settings?.stakeLevel !== void 0) {
+      const lvl = Number(settings.stakeLevel);
+      if (!Number.isInteger(lvl) || lvl < 0 || lvl > 3) throw new GameError("BAD_STAKE", "Unbekannter Einsatz.");
+      room.settings.stakeLevel = lvl;
+    }
+    if (settings?.stakes !== void 0 && settings.stakes !== room.settings.stakes) {
+      if (!["free", "wallet"].includes(settings.stakes)) throw new GameError("BAD_STAKE", "Unbekannte Spielart.");
+      if (settings.stakes === "wallet") {
+        if (!this.wallet) throw new GameError("NO_WALLET", "Taler-Tische gibt es hier nicht.");
+        const humans = room.humans;
+        if ([...room.players.values()].some((p) => p.bot)) throw new GameError("NO_BOTS", "Erst die Computer-Gegner entfernen \u2013 um Taler spielen nur echte Mitspieler.");
+        const noAcc = humans.filter((p) => !p.accountId);
+        if (noAcc.length) throw new GameError("NEED_ACCOUNT", `${noAcc.map((p) => p.name).join(", ")} ${noAcc.length === 1 ? "hat" : "haben"} noch kein Konto.`);
+        const locked = [];
+        try {
+          for (const p of humans) {
+            this.wallet.lock(p.accountId, room.code);
+            locked.push(p.accountId);
+          }
+        } catch (err) {
+          locked.forEach((a) => this.wallet.unlock(a, room.code));
+          const who = humans.find((p) => this.wallet.lockOf(p.accountId) && this.wallet.lockOf(p.accountId) !== room.code);
+          throw new GameError("BUSY_TABLE", `${who?.name ?? "Jemand"} sitzt schon an einem anderen Taler-Tisch.`);
+        }
+      } else this.#unlockAll(room);
+      room.settings.stakes = settings.stakes;
+    }
   }
   /** Öffentliche Tische, die noch auf Mitspieler warten. */
   listOpenRooms() {
@@ -3411,18 +3650,47 @@ var RoomManager = class {
       mode: r.settings.mode,
       game: r.settings.game,
       ...r.settings.game === GAMES.CHESS && { chessTime: r.settings.chessTime, chessColor: r.settings.chessColor },
-      ...r.settings.game === GAMES.POKER && { pokerMode: r.settings.pokerMode, pokerBlinds: r.settings.pokerBlinds }
+      ...r.settings.game === GAMES.POKER && { pokerMode: r.settings.pokerMode, pokerBlinds: r.settings.pokerBlinds },
+      ...isWallet(r) && { stake: stakeOf(r.settings) }
     })).slice(0, 50);
+  }
+  /** Taler-Tisch: Bedingungen vor dem Start (ohne Geld – das prüft der Handler). */
+  assertWalletStart(room, playerId) {
+    this.#assertHost(room, playerId);
+    if (room.active) throw new GameError("ALREADY_STARTED", "Das Spiel l\xE4uft bereits.");
+    if ([...room.players.values()].some((p) => p.bot)) throw new GameError("NO_BOTS", "Um Taler spielen nur echte Mitspieler.");
+    const humans = room.humans;
+    const need = { schafkopf: 4, chess: 2, poker: 2, luegen: MIN_PLAYERS, blackjack: 1 }[room.settings.game] ?? 2;
+    if (room.settings.game === GAMES.SCHAFKOPF && humans.length !== 4) throw new GameError("PLAYER_COUNT", "Um Taler braucht Schafkopf 4 echte Spieler.");
+    if (humans.length < need) throw new GameError("PLAYER_COUNT", `Mindestens ${need} Spieler n\xF6tig.`);
+    const noAcc = humans.filter((p) => !p.accountId);
+    if (noAcc.length) throw new GameError("NEED_ACCOUNT", `${noAcc.map((p) => p.name).join(", ")} ${noAcc.length === 1 ? "hat" : "haben"} kein Konto.`);
+    return humans;
+  }
+  escrowFor(room) {
+    return isWallet(room) ? escrowFor(room) : [];
+  }
+  /** Buchungsaufträge abholen (Handler). */
+  takeWalletOps(room) {
+    this.#queue(room, endOps(room));
+    const ops = room.walletOps;
+    room.walletOps = [];
+    return ops;
   }
   startGame(room, playerId) {
     this.#assertHost(room, playerId);
     if (room.active) throw new GameError("ALREADY_STARTED", "Das Spiel l\xE4uft bereits.");
+    if (isWallet(room)) this.assertWalletStart(room, playerId);
     room.pauses.clear();
     room.ready.clear();
+    room.walletClosed = false;
+    room.walletGameIds = room.humans.map((p) => p.id);
+    room.walletEntrants = room.humans.length;
+    room.walletPool = room.settings.game === GAMES.POKER && room.settings.pokerMode === "tournament" ? stakeOf(room.settings) * room.humans.length : 0;
     if (room.settings.game === GAMES.CHESS) return this.#startChess(room, false);
     if (CASINO.has(room.settings.game)) return this.#startCasino(room);
     if (room.settings.game === GAMES.SCHAFKOPF) {
-      while (room.players.size < GAME_MAX_PLAYERS.schafkopf) this.#createBot(room, "normal");
+      while (!isWallet(room) && room.players.size < GAME_MAX_PLAYERS.schafkopf) this.#createBot(room, "normal");
       room.game = new SchafkopfGame([...room.players.values()], { variant: room.settings.skVariant, pass: room.settings.skPass, extras: room.settings.skExtras });
       room.botKey = null;
       room.personas = Object.fromEntries([...room.players.values()].filter((p) => p.bot).map((p) => [p.id, makePersona(p.base, p.difficulty)]));
@@ -3442,7 +3710,8 @@ var RoomManager = class {
   #startCasino(room) {
     const st = room.settings;
     const poker = st.game === GAMES.POKER;
-    if (poker) while (room.players.size < 2) this.#createBot(room, "normal");
+    const wallet = isWallet(room);
+    if (poker && !wallet) while (room.players.size < 2) this.#createBot(room, "normal");
     const seats = [...room.players.values()];
     const bots = seats.filter((p) => p.bot);
     room.personas = Object.fromEntries(
@@ -3454,11 +3723,16 @@ var RoomManager = class {
     room.botKey = null;
     const turnMs = st.turnSec ? st.turnSec * 1e3 : 0;
     if (poker) {
-      const [sb, bb] = st.pokerBlinds.split("/").map(Number);
-      room.game = new PokerGame(seats, { startChips: st.pokerChips, sb, bb, mode: st.pokerMode, turnMs });
+      let [sb, bb] = st.pokerBlinds.split("/").map(Number);
+      let startChips = st.pokerChips;
+      if (wallet && st.pokerMode === "cash") {
+        startChips = stakeOf(st);
+        ({ sb, bb } = walletBlinds(startChips));
+      }
+      room.game = new PokerGame(seats, { startChips, sb, bb, mode: st.pokerMode, turnMs, rebuy: !wallet });
       return { type: "poker_start" };
     }
-    room.game = new BlackjackGame(seats, { decks: st.bjDecks, h17: st.bjH17, bjPays: st.bjPays, surrender: st.bjSurrender, turnMs });
+    room.game = new BlackjackGame(seats, { decks: st.bjDecks, h17: st.bjH17, bjPays: st.bjPays, surrender: st.bjSurrender, turnMs, ...wallet && { startChips: stakeOf(st), refill: false } });
     return { type: "bj_start" };
   }
   #startChess(room, swap) {
@@ -3490,6 +3764,7 @@ var RoomManager = class {
   backToLobby(room, playerId) {
     this.#assertHost(room, playerId);
     if (room.active && !CASINO.has(room.game?.kind)) throw new GameError("ALREADY_STARTED", "Das Spiel l\xE4uft noch.");
+    this.#queue(room, closeOps(room));
     clearTimeout(room.casinoTimer);
     room.game = null;
     room.pauses.clear();
@@ -3925,8 +4200,76 @@ var GRACE_MS = {
 var DEFAULT_PAUSE_MS = 10 * 1e3;
 var RATE_LIMIT = { windowMs: 2e3, max: 30 };
 var BOT_TIMING = { min: 900, max: 1700, pending: [1400, 2200], first: [1600, 2300], afterReveal: 3800, afterTrick: 1500 };
-function registerSocketHandlers(io, rooms, { pauseMs = DEFAULT_PAUSE_MS, botTiming = BOT_TIMING, chessAbandonMs = CHESS_ABANDON_MS } = {}) {
+function registerSocketHandlers(io, rooms, { pauseMs = DEFAULT_PAUSE_MS, botTiming = BOT_TIMING, chessAbandonMs = CHESS_ABANDON_MS, wallet = null, walletPauseMs = 45 * 1e3 } = {}) {
   const presence = /* @__PURE__ */ new Map();
+  const socketAccount = /* @__PURE__ */ new Map();
+  const accountSockets = /* @__PURE__ */ new Map();
+  function bindAccount(socket, accountId) {
+    unbindAccount(socket);
+    socketAccount.set(socket.id, accountId);
+    if (!accountSockets.has(accountId)) accountSockets.set(accountId, /* @__PURE__ */ new Set());
+    accountSockets.get(accountId).add(socket.id);
+  }
+  function unbindAccount(socket) {
+    const prev = socketAccount.get(socket.id);
+    if (!prev) return;
+    socketAccount.delete(socket.id);
+    accountSockets.get(prev)?.delete(socket.id);
+    if (!accountSockets.get(prev)?.size) accountSockets.delete(prev);
+  }
+  async function accountOf(socket) {
+    const id = socketAccount.get(socket.id);
+    return id && wallet ? wallet.account(id) : null;
+  }
+  if (wallet) {
+    wallet.onChange((balances) => {
+      const touched = /* @__PURE__ */ new Set();
+      for (const [accountId, balance] of Object.entries(balances)) {
+        for (const sid of accountSockets.get(accountId) ?? []) io.to(sid).emit(EVT.ACC_BALANCE, { balance });
+        const code = wallet.lockOf(accountId);
+        const room = code && rooms.rooms.get(code);
+        if (room) {
+          (room.balances ??= /* @__PURE__ */ new Map()).set(accountId, balance);
+          touched.add(room);
+        }
+      }
+      for (const room of touched) sendState(room);
+    });
+  }
+  async function refreshBalances(room) {
+    if (!wallet || !isWallet(room)) return;
+    room.balances ??= /* @__PURE__ */ new Map();
+    for (const p of room.players.values()) if (p.accountId) room.balances.set(p.accountId, await wallet.balanceOf(p.accountId));
+  }
+  function flushWallet(room) {
+    if (!wallet) return;
+    const ops = rooms.takeWalletOps(room);
+    if (!ops.length) return;
+    room.walletChain = (room.walletChain ?? Promise.resolve()).then(async () => {
+      for (const op of ops) {
+        try {
+          const deltas = {};
+          if (op.kind === "payout") {
+            await wallet.payout(room.code, op.entries.map((e) => ({ ...e, game: room.settings.game })), op.release);
+            for (const e of op.entries) if (e.amount) deltas[e.playerId] = (deltas[e.playerId] ?? 0) + e.amount;
+          } else {
+            const applied = await wallet.settle(op.entries, op.reason, room.settings.game);
+            for (const e of op.entries) if (applied[e.accountId] != null) deltas[e.playerId] = applied[e.accountId];
+          }
+          if (Object.keys(deltas).length) emitEvent(room, { type: "wallet", kind: op.kind, reason: op.reason ?? op.entries[0]?.reason, deltas });
+        } catch (err) {
+          console.error("[wallet]", err);
+        }
+      }
+      if (rooms.rooms.has(room.code)) sendState(room);
+    });
+    return room.walletChain;
+  }
+  function sendState(room) {
+    for (const player of room.players.values()) {
+      if (player.socketId) io.to(player.socketId).emit(EVT.ROOM_STATE, room.stateFor(player.id));
+    }
+  }
   function scheduleChessTimer(room) {
     clearTimeout(room.chessTimer);
     const game = room.game;
@@ -4059,6 +4402,7 @@ function registerSocketHandlers(io, rooms, { pauseMs = DEFAULT_PAUSE_MS, botTimi
   }
   function broadcastState(room) {
     rooms.recordIfDone(room);
+    flushWallet(room);
     for (const player of room.players.values()) {
       if (player.socketId) io.to(player.socketId).emit(EVT.ROOM_STATE, room.stateFor(player.id));
     }
@@ -4262,17 +4606,27 @@ function registerSocketHandlers(io, rooms, { pauseMs = DEFAULT_PAUSE_MS, botTimi
   }
   io.on("connection", (socket) => {
     socket.data = {};
-    on(socket, EVT.ROOM_CREATE, ({ name, restore, settings }) => {
+    on(socket, EVT.ROOM_CREATE, async ({ name, restore, settings }) => {
       leaveCurrent(socket);
-      const { room, player } = rooms.createRoom(name, restore, settings);
+      const account = await accountOf(socket);
+      const { room, player } = rooms.createRoom(name, restore, settings, account);
       attach(socket, room, player);
+      await refreshBalances(room);
       broadcastState(room);
       return sessionPayload(room, player);
     });
-    on(socket, EVT.ROOM_JOIN, ({ code, name }) => {
+    on(socket, EVT.ROOM_JOIN, async ({ code, name }) => {
       leaveCurrent(socket);
-      const { room, player } = rooms.joinRoom(code, name);
+      const account = await accountOf(socket);
+      const target = rooms.getRoom(code);
+      if (isWallet(target) && account && wallet) {
+        const need = minBalanceFor(target.settings, Math.min(target.maxPlayers, target.players.size + 1));
+        const bal = await wallet.balanceOf(account.id);
+        if (bal < need) throw new GameError("LOW_BALANCE", `F\xFCr diesen Tisch brauchst du mindestens ${fmtTaler(need)} (du hast ${fmtTaler(bal)}).`);
+      }
+      const { room, player } = rooms.joinRoom(code, name, account);
       attach(socket, room, player);
+      await refreshBalances(room);
       emitEvent(room, { type: "joined", playerId: player.id, name: player.name });
       broadcastState(room);
       return sessionPayload(room, player);
@@ -4298,9 +4652,10 @@ function registerSocketHandlers(io, rooms, { pauseMs = DEFAULT_PAUSE_MS, botTimi
       leaveCurrent(socket);
       return {};
     });
-    on(socket, EVT.ROOM_SETTINGS, (settings) => {
+    on(socket, EVT.ROOM_SETTINGS, async (settings) => {
       const { room, player } = ctx(socket);
       rooms.updateSettings(room, player.id, settings);
+      await refreshBalances(room);
       broadcastState(room);
       return {};
     });
@@ -4327,10 +4682,56 @@ function registerSocketHandlers(io, rooms, { pauseMs = DEFAULT_PAUSE_MS, botTimi
       broadcastState(room);
       return { playerId: bot.id };
     });
-    on(socket, EVT.GAME_START, () => {
+    on(socket, EVT.GAME_START, async () => {
       const { room, player } = ctx(socket);
+      if (isWallet(room)) {
+        if (!wallet) throw new GameError("NO_WALLET", "Taler-Tische gibt es hier nicht.");
+        if (room.starting) throw new GameError("BUSY", "Wird schon gestartet \u2026");
+        const humans = rooms.assertWalletStart(room, player.id);
+        room.starting = true;
+        try {
+          await room.walletChain;
+          const need = minBalanceFor(room.settings, humans.length);
+          for (const p of humans) {
+            const bal = await wallet.balanceOf(p.accountId);
+            if (bal < need) throw new GameError("LOW_BALANCE", `${p.name} hat zu wenig Taler (${fmtTaler(bal)}, n\xF6tig: ${fmtTaler(need)}).`);
+          }
+          const escrow = rooms.escrowFor(room).map((e) => ({ ...e, game: room.settings.game }));
+          await wallet.escrow(room.code, escrow);
+          let ev;
+          try {
+            ev = rooms.startGame(room, player.id);
+          } catch (err) {
+            await wallet.payout(room.code, escrow.map((e) => ({ ...e, reason: "Start abgebrochen \u2013 zur\xFCck" })), "all");
+            throw err;
+          }
+          if (escrow.length) emitEvent(room, { type: "wallet", kind: "escrow", reason: escrow[0].reason, deltas: Object.fromEntries(escrow.map((e) => [e.playerId, -e.amount])) });
+          emitEvent(room, ev);
+        } finally {
+          room.starting = false;
+        }
+        await refreshBalances(room);
+        broadcastState(room);
+        return {};
+      }
       emitEvent(room, rooms.startGame(room, player.id));
       broadcastState(room);
+      return {};
+    });
+    on(socket, EVT.CASINO_REBUY, async () => {
+      const { room, player } = ctx(socket);
+      const g = room.game;
+      if (!isWallet(room) || !wallet || g?.kind !== "poker" && g?.kind !== "blackjack") throw new GameError("NO_REBUY", "Nachkaufen gibt es nur an Taler-Tischen.");
+      const amount = stakeOf(room.settings);
+      if (g.kind === "poker" && (g.mode !== "cash" || g.stacks[player.id] > 0 || g.phase === "over")) throw new GameError("NOT_NOW", "Nachkaufen geht erst, wenn du pleite bist.");
+      if (g.kind === "blackjack" && (g.phase !== "betting" || g.ready.has(player.id) || g.chips[player.id] >= g.opts.minBet)) throw new GameError("NOT_NOW", "Nachkaufen geht nur vor dem Setzen, wenn deine Chips nicht mehr reichen.");
+      await wallet.escrow(room.code, [{ accountId: player.accountId, amount, reason: `Nachkauf ${g.kind === "poker" ? "Poker" : "Blackjack"}`, game: g.kind }]);
+      try {
+        casinoAction(room, (game) => game.rebuy(player.id, amount));
+      } catch (err) {
+        await wallet.payout(room.code, [{ accountId: player.accountId, amount, reason: "Nachkauf zur\xFCck" }], []);
+        throw err;
+      }
       return {};
     });
     on(socket, EVT.GAME_PLAY, ({ cardIds, claimRank, claimCount }) => {
@@ -4373,8 +4774,25 @@ function registerSocketHandlers(io, rooms, { pauseMs = DEFAULT_PAUSE_MS, botTimi
       applyAction(room, player.id, { type: "sk_marry", cardId: cardId ? String(cardId) : null });
       return {};
     });
-    on(socket, EVT.SK_NEXT, () => {
+    on(socket, EVT.SK_NEXT, async () => {
       const { room, player } = ctx(socket);
+      if (isWallet(room) && wallet && room.game?.kind === "schafkopf" && room.game.phase === "scored") {
+        const waiting = room.humans.filter((p) => p.id !== player.id && p.connected && !room.ready.has(p.id));
+        if (!waiting.length) {
+          await room.walletChain;
+          const need = minBalanceFor(room.settings, 4);
+          for (const p of room.humans) {
+            const bal = await wallet.balanceOf(p.accountId);
+            if (bal < need) {
+              room.game = null;
+              room.ready.clear();
+              emitEvent(room, { type: "wallet_broke", playerId: p.id, name: p.name, need });
+              broadcastState(room);
+              return {};
+            }
+          }
+        }
+      }
       const event = rooms.readyNext(room, player.id);
       emitEvent(room, event);
       broadcastState(room);
@@ -4395,8 +4813,29 @@ function registerSocketHandlers(io, rooms, { pauseMs = DEFAULT_PAUSE_MS, botTimi
       chessAction(room, (g) => g.draw(player.id, String(action)));
       return {};
     });
-    on(socket, EVT.CHESS_REMATCH, () => {
+    on(socket, EVT.CHESS_REMATCH, async () => {
       const { room, player } = ctx(socket);
+      if (isWallet(room) && wallet && room.game?.kind === "chess" && room.game.phase === "over") {
+        const waiting = room.humans.filter((p) => p.id !== player.id && !room.ready.has(p.id));
+        if (!waiting.length) {
+          if (room.starting) throw new GameError("BUSY", "Wird schon gestartet \u2026");
+          room.starting = true;
+          try {
+            await room.walletChain;
+            const escrow = rooms.escrowFor(room).map((e) => ({ ...e, game: "chess" }));
+            await wallet.escrow(room.code, escrow);
+            emitEvent(room, rooms.chessRematch(room, player.id));
+            emitEvent(room, { type: "wallet", kind: "escrow", reason: "Einsatz Schach", deltas: Object.fromEntries(escrow.map((e) => [e.playerId, -e.amount])) });
+          } catch (err) {
+            room.ready.clear();
+            throw err;
+          } finally {
+            room.starting = false;
+          }
+          broadcastState(room);
+          return {};
+        }
+      }
       emitEvent(room, rooms.chessRematch(room, player.id));
       broadcastState(room);
       return {};
@@ -4484,6 +4923,47 @@ function registerSocketHandlers(io, rooms, { pauseMs = DEFAULT_PAUSE_MS, botTimi
       }
       return { sent: reached.size };
     });
+    const needWallet = async () => {
+      if (!wallet) throw new GameError("NO_WALLET", "Konten gibt es auf diesem Server nicht.");
+      try {
+        await wallet.ready;
+      } catch {
+        throw new GameError("WALLET_DOWN", "Die Konten sind gerade nicht erreichbar.");
+      }
+    };
+    on(socket, EVT.ACC_REGISTER, async ({ name, pin }) => {
+      await needWallet();
+      const res = await wallet.register(name, pin);
+      bindAccount(socket, res.account.id);
+      return { ...res, persistent: wallet.persistent };
+    });
+    on(socket, EVT.ACC_LOGIN, async ({ name, pin }) => {
+      await needWallet();
+      const res = await wallet.login(name, pin);
+      bindAccount(socket, res.account.id);
+      return { ...res, persistent: wallet.persistent };
+    });
+    on(socket, EVT.ACC_RESUME, async ({ token }) => {
+      await needWallet();
+      const res = await wallet.resume(String(token ?? ""));
+      if (!res) throw new GameError("SESSION_EXPIRED", "Bitte neu anmelden.");
+      bindAccount(socket, res.account.id);
+      return { ...res, persistent: wallet.persistent };
+    });
+    on(socket, EVT.ACC_LOGOUT, async ({ token }) => {
+      await needWallet();
+      const accId = socketAccount.get(socket.id);
+      if (accId && wallet.lockOf(accId)) throw new GameError("BUSY_TABLE", "Erst den Taler-Tisch verlassen.");
+      await wallet.logout(String(token ?? ""));
+      unbindAccount(socket);
+      return {};
+    });
+    on(socket, EVT.ACC_HISTORY, async () => {
+      await needWallet();
+      const accId = socketAccount.get(socket.id);
+      if (!accId) throw new GameError("NOT_LOGGED_IN", "Nicht angemeldet.");
+      return { account: await wallet.account(accId), history: await wallet.history(accId, 60) };
+    });
     on(socket, EVT.CHAT_SEND, ({ text }) => {
       const { room, player } = ctx(socket);
       const clean = String(text ?? "").replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim().slice(0, CHAT_MAX_LENGTH);
@@ -4502,6 +4982,7 @@ function registerSocketHandlers(io, rooms, { pauseMs = DEFAULT_PAUSE_MS, botTimi
     });
     socket.on("disconnect", () => {
       presence.delete(socket.id);
+      unbindAccount(socket);
       const { code, playerId } = socket.data ?? {};
       if (!code) return;
       const room = rooms.rooms.get(code);
@@ -4526,20 +5007,25 @@ function registerSocketHandlers(io, rooms, { pauseMs = DEFAULT_PAUSE_MS, botTimi
         emitEvent(room, { type: "disconnected", playerId: player.id, name: player.name, casino: true });
         room.casinoKey = null;
       } else if (room.active && room.game.order.includes(player.id)) {
-        room.pauses.set(player.id, Date.now() + pauseMs);
-        emitEvent(room, { type: "disconnected", playerId: player.id, name: player.name, pauseMs });
+        const wait = isWallet(room) ? Math.max(pauseMs, walletPauseMs) : pauseMs;
+        room.pauses.set(player.id, Date.now() + wait);
+        emitEvent(room, { type: "disconnected", playerId: player.id, name: player.name, pauseMs: wait });
         clearTimeout(player.pauseTimer);
         player.pauseTimer = setTimeout(() => {
           if (player.connected || !room.pauses.has(player.id)) return;
           room.pauses.delete(player.id);
-          if (room.game?.kind === "schafkopf" && room.game.order.includes(player.id)) {
+          if (isWallet(room)) {
+            const event = rooms.removePlayer(room, player.id);
+            emitEvent(room, { type: "left", playerId: player.id, timeout: true });
+            emitEvent(room, event);
+          } else if (room.game?.kind === "schafkopf" && room.game.order.includes(player.id)) {
             player.autoplay = true;
             emitEvent(room, { type: "autoplay", playerId: player.id, name: player.name });
           } else if (room.game?.phase === PHASES.PLAYING && room.game.order.includes(player.id)) {
             emitEvent(room, { ...room.game.removePlayer(player.id), reason: "timeout", name: player.name });
           }
           broadcastState(room);
-        }, pauseMs);
+        }, wait);
         player.pauseTimer.unref?.();
       }
       broadcastState(room);
@@ -4582,8 +5068,8 @@ var FOREIGN_SCRIPT = /[\u0400-\u04FF\u0590-\u06FF\u0900-\u0DFF\u0E00-\u0E7F\u304
 function youtubeRouter() {
   const router = express.Router();
   const cache = /* @__PURE__ */ new Map();
-  async function api(path3, params) {
-    const url = `${API}/${path3}?${new URLSearchParams({ ...params, key: key() })}`;
+  async function api(path4, params) {
+    const url = `${API}/${path4}?${new URLSearchParams({ ...params, key: key() })}`;
     const hit = cache.get(url);
     if (hit && Date.now() - hit.at < TTL) return hit.data;
     const res = await fetch(url);
@@ -4646,10 +5132,467 @@ function youtubeRouter() {
   return router;
 }
 
+// src/wallet/Wallet.js
+import { createHash, randomBytes as randomBytes3, scrypt as scryptCb, timingSafeEqual } from "node:crypto";
+import { promisify } from "node:util";
+
+// src/wallet/store.js
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import path from "node:path";
+var StoreError = class extends Error {
+  constructor(code, message) {
+    super(message);
+    this.code = code;
+  }
+};
+var TX_KEEP = 200;
+var FileStore = class {
+  constructor(file = null) {
+    this.file = file;
+    this.persistent = Boolean(file);
+    this.data = { accounts: {}, tx: {}, sessions: {}, holds: [], seq: 0 };
+    this.timer = null;
+  }
+  async init() {
+    if (!this.file) return;
+    mkdirSync(path.dirname(this.file), { recursive: true });
+    if (existsSync(this.file)) {
+      try {
+        const d = JSON.parse(readFileSync(this.file, "utf8"));
+        this.data = { accounts: d.accounts ?? {}, tx: d.tx ?? {}, sessions: d.sessions ?? {}, holds: d.holds ?? [], seq: d.seq ?? 0 };
+      } catch (err) {
+        console.error("[wallet] Datei unlesbar, starte leer:", err.message);
+      }
+    }
+    process.once("exit", () => {
+      if (!this.timer) return;
+      try {
+        this.flush();
+      } catch {
+      }
+    });
+  }
+  #save() {
+    if (!this.file || this.timer) return;
+    this.timer = setTimeout(() => {
+      try {
+        this.flush();
+      } catch (err) {
+        console.error("[wallet] Speichern fehlgeschlagen:", err.message);
+      }
+    }, 250);
+    this.timer.unref?.();
+  }
+  flush() {
+    clearTimeout(this.timer);
+    this.timer = null;
+    if (!this.file) return;
+    const tmp = `${this.file}.tmp`;
+    writeFileSync(tmp, JSON.stringify(this.data));
+    renameSync(tmp, this.file);
+  }
+  async findAccountByName(name) {
+    const low = String(name).toLowerCase();
+    return Object.values(this.data.accounts).find((a) => a.nameLower === low) ?? null;
+  }
+  async getAccount(id) {
+    return this.data.accounts[id] ?? null;
+  }
+  async insertAccount(acc2) {
+    if (await this.findAccountByName(acc2.name)) throw new StoreError("NAME_TAKEN", "Diesen Namen gibt es schon.");
+    this.data.accounts[acc2.id] = { ...acc2, balance: 0 };
+    this.data.tx[acc2.id] = [];
+    this.#save();
+  }
+  async updateAccount(id, fields) {
+    const a = this.data.accounts[id];
+    if (!a) return;
+    for (const k of ["failed", "lockedUntil", "dailyDay"]) if (k in fields) a[k] = fields[k];
+    this.#save();
+  }
+  /** Mehrere Buchungen auf einmal – alle oder keine. */
+  async applyTransactions(list, { allowNegative = false } = {}) {
+    const next = {};
+    for (const t of list) {
+      const a = this.data.accounts[t.accountId];
+      if (!a) throw new StoreError("NO_ACCOUNT", "Konto nicht gefunden.");
+      const cur = next[t.accountId] ?? a.balance;
+      const val = cur + t.amount;
+      if (val < 0 && !allowNegative) throw new StoreError("INSUFFICIENT", `${a.name} hat nicht genug Taler.`);
+      next[t.accountId] = val;
+    }
+    const at = Date.now();
+    const running = {};
+    for (const t of list) {
+      const a = this.data.accounts[t.accountId];
+      running[t.accountId] = (running[t.accountId] ?? a.balance) + t.amount;
+      const rows = this.data.tx[t.accountId] ??= [];
+      rows.push({ id: ++this.data.seq, amount: t.amount, balanceAfter: running[t.accountId], reason: String(t.reason).slice(0, 80), game: t.game ?? null, at });
+      if (rows.length > TX_KEEP) rows.splice(0, rows.length - TX_KEEP);
+    }
+    for (const [id, val] of Object.entries(next)) this.data.accounts[id].balance = val;
+    this.#save();
+    return next;
+  }
+  async listTransactions(id, limit = 50) {
+    return (this.data.tx[id] ?? []).slice(-limit).reverse();
+  }
+  async putSession(tokenHash, accountId) {
+    this.data.sessions[tokenHash] = { accountId, at: Date.now() };
+    this.#save();
+  }
+  async getSession(tokenHash) {
+    return this.data.sessions[tokenHash]?.accountId ?? null;
+  }
+  async deleteSession(tokenHash) {
+    delete this.data.sessions[tokenHash];
+    this.#save();
+  }
+  // Gesicherte Einsätze (liegen gerade auf einem Tisch) – nach einem Neustart zurückbuchen
+  async addHolds(code, rows) {
+    for (const r of rows) this.data.holds.push({ code, accountId: r.accountId, amount: r.amount });
+    this.#save();
+  }
+  async removeHolds(code, accountIds = null) {
+    this.data.holds = this.data.holds.filter((h) => h.code !== code || accountIds && !accountIds.includes(h.accountId));
+    this.#save();
+  }
+  async takeAllHolds() {
+    const all = this.data.holds;
+    this.data.holds = [];
+    this.#save();
+    return all;
+  }
+};
+var rowToAccount = (r) => r && {
+  id: r.id,
+  name: r.name,
+  nameLower: r.name_lower,
+  pinHash: r.pin_hash,
+  salt: r.salt,
+  balance: Number(r.balance),
+  dailyDay: r.daily_day,
+  failed: r.failed,
+  lockedUntil: Number(r.locked_until),
+  createdAt: Number(r.created_at)
+};
+var PgStore = class {
+  constructor(url, pgModule = null) {
+    this.url = url;
+    this.persistent = true;
+    this.pool = null;
+    this.pgModule = pgModule;
+  }
+  async init() {
+    const pg = this.pgModule ?? (await import("pg")).default;
+    const local = /localhost|127\.0\.0\.1/.test(this.url);
+    this.pool = new pg.Pool({ connectionString: this.url, max: 5, ssl: local ? false : { rejectUnauthorized: false }, idleTimeoutMillis: 3e4 });
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS accounts (
+        id text PRIMARY KEY, name text NOT NULL, name_lower text UNIQUE NOT NULL,
+        pin_hash text NOT NULL, salt text NOT NULL, balance bigint NOT NULL DEFAULT 0,
+        daily_day text, failed int NOT NULL DEFAULT 0, locked_until bigint NOT NULL DEFAULT 0, created_at bigint NOT NULL);
+      CREATE TABLE IF NOT EXISTS wallet_tx (
+        id bigserial PRIMARY KEY, account_id text NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        amount bigint NOT NULL, balance_after bigint NOT NULL, reason text NOT NULL, game text, created_at bigint NOT NULL);
+      CREATE INDEX IF NOT EXISTS wallet_tx_acc ON wallet_tx (account_id, id DESC);
+      CREATE TABLE IF NOT EXISTS sessions (
+        token_hash text PRIMARY KEY, account_id text NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, created_at bigint NOT NULL);
+      CREATE TABLE IF NOT EXISTS wallet_holds (
+        id bigserial PRIMARY KEY, code text NOT NULL, account_id text NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, amount bigint NOT NULL);
+    `);
+  }
+  async findAccountByName(name) {
+    const { rows } = await this.pool.query("SELECT * FROM accounts WHERE name_lower = $1", [String(name).toLowerCase()]);
+    return rowToAccount(rows[0]) ?? null;
+  }
+  async getAccount(id) {
+    const { rows } = await this.pool.query("SELECT * FROM accounts WHERE id = $1", [id]);
+    return rowToAccount(rows[0]) ?? null;
+  }
+  async insertAccount(a) {
+    try {
+      await this.pool.query("INSERT INTO accounts (id, name, name_lower, pin_hash, salt, balance, daily_day, created_at) VALUES ($1,$2,$3,$4,$5,0,$6,$7)", [
+        a.id,
+        a.name,
+        a.nameLower,
+        a.pinHash,
+        a.salt,
+        a.dailyDay ?? null,
+        a.createdAt
+      ]);
+    } catch (err) {
+      if (err.code === "23505") throw new StoreError("NAME_TAKEN", "Diesen Namen gibt es schon.");
+      throw err;
+    }
+  }
+  async updateAccount(id, fields) {
+    const map = { failed: "failed", lockedUntil: "locked_until", dailyDay: "daily_day" };
+    const keys = Object.keys(fields).filter((k) => map[k]);
+    if (!keys.length) return;
+    await this.pool.query(`UPDATE accounts SET ${keys.map((k, i) => `${map[k]} = $${i + 2}`).join(", ")} WHERE id = $1`, [id, ...keys.map((k) => fields[k])]);
+  }
+  async applyTransactions(list, { allowNegative = false } = {}) {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const ids = [...new Set(list.map((t) => t.accountId))].sort();
+      for (const id of ids) await client.query("SELECT 1 FROM accounts WHERE id = $1 FOR UPDATE", [id]);
+      const out = {};
+      const at = Date.now();
+      for (const t of list) {
+        const { rows } = await client.query(`UPDATE accounts SET balance = balance + $2 WHERE id = $1 ${allowNegative ? "" : "AND balance + $2 >= 0"} RETURNING balance, name`, [t.accountId, t.amount]);
+        if (!rows.length) {
+          const { rows: who } = await client.query("SELECT name FROM accounts WHERE id = $1", [t.accountId]);
+          throw new StoreError(who.length ? "INSUFFICIENT" : "NO_ACCOUNT", who.length ? `${who[0].name} hat nicht genug Taler.` : "Konto nicht gefunden.");
+        }
+        const bal = Number(rows[0].balance);
+        out[t.accountId] = bal;
+        await client.query("INSERT INTO wallet_tx (account_id, amount, balance_after, reason, game, created_at) VALUES ($1,$2,$3,$4,$5,$6)", [t.accountId, t.amount, bal, String(t.reason).slice(0, 80), t.game ?? null, at]);
+      }
+      await client.query("COMMIT");
+      return out;
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {
+      });
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+  async listTransactions(id, limit = 50) {
+    const { rows } = await this.pool.query("SELECT id, amount, balance_after, reason, game, created_at FROM wallet_tx WHERE account_id = $1 ORDER BY id DESC LIMIT $2", [id, limit]);
+    return rows.map((r) => ({ id: Number(r.id), amount: Number(r.amount), balanceAfter: Number(r.balance_after), reason: r.reason, game: r.game, at: Number(r.created_at) }));
+  }
+  async putSession(tokenHash, accountId) {
+    await this.pool.query("INSERT INTO sessions (token_hash, account_id, created_at) VALUES ($1,$2,$3) ON CONFLICT (token_hash) DO NOTHING", [tokenHash, accountId, Date.now()]);
+  }
+  async getSession(tokenHash) {
+    const { rows } = await this.pool.query("SELECT account_id FROM sessions WHERE token_hash = $1", [tokenHash]);
+    return rows[0]?.account_id ?? null;
+  }
+  async deleteSession(tokenHash) {
+    await this.pool.query("DELETE FROM sessions WHERE token_hash = $1", [tokenHash]);
+  }
+  async addHolds(code, rows) {
+    for (const r of rows) await this.pool.query("INSERT INTO wallet_holds (code, account_id, amount) VALUES ($1,$2,$3)", [code, r.accountId, r.amount]);
+  }
+  async removeHolds(code, accountIds = null) {
+    if (accountIds) await this.pool.query("DELETE FROM wallet_holds WHERE code = $1 AND account_id = ANY($2)", [code, accountIds]);
+    else await this.pool.query("DELETE FROM wallet_holds WHERE code = $1", [code]);
+  }
+  async takeAllHolds() {
+    const { rows } = await this.pool.query("DELETE FROM wallet_holds RETURNING code, account_id, amount");
+    return rows.map((r) => ({ code: r.code, accountId: r.account_id, amount: Number(r.amount) }));
+  }
+};
+function createStore({ databaseUrl = process.env.DATABASE_URL, dataDir = process.env.DATA_DIR, memory = false } = {}) {
+  if (memory) return new FileStore(null);
+  if (databaseUrl) return new PgStore(databaseUrl);
+  const store = new FileStore(path.join(dataDir || path.resolve(process.cwd(), "data"), "wallet.json"));
+  if (process.env.RENDER) store.persistent = false;
+  return store;
+}
+
+// src/wallet/Wallet.js
+var scrypt = promisify(scryptCb);
+var MAX_FAILS = 5;
+var LOCK_MS = 5 * 60 * 1e3;
+var hashToken = (t) => createHash("sha256").update(String(t)).digest("hex");
+var berlinDay = (d = /* @__PURE__ */ new Date()) => new Intl.DateTimeFormat("sv-SE", { timeZone: "Europe/Berlin" }).format(d);
+function cleanName(raw) {
+  const name = String(raw ?? "").replace(/[\u0000-\u001f\u007f<>]/g, "").replace(/\s+/g, " ").trim().slice(0, NAME_MAX_LENGTH);
+  if (name.length < 2) throw new GameError("BAD_NAME", "Der Name braucht mindestens 2 Zeichen.");
+  return name;
+}
+function checkPin(pin) {
+  const p = String(pin ?? "");
+  if (!/^\d+$/.test(p) || p.length < WALLET.pinMin || p.length > WALLET.pinMax) throw new GameError("BAD_PIN", `Die PIN muss aus ${WALLET.pinMin}\u2013${WALLET.pinMax} Ziffern bestehen.`);
+  return p;
+}
+async function hashPin(pin, salt) {
+  return (await scrypt(pin, salt, 32)).toString("hex");
+}
+var publicAccount = (a) => ({ id: a.id, name: a.name, balance: a.balance });
+var Wallet = class {
+  constructor(store) {
+    this.store = store;
+    this.locks = /* @__PURE__ */ new Map();
+    this.listeners = /* @__PURE__ */ new Set();
+  }
+  get persistent() {
+    return this.store.persistent;
+  }
+  async init() {
+    await this.store.init();
+    const holds = await this.store.takeAllHolds();
+    if (holds.length) {
+      const sum = {};
+      for (const h of holds) sum[h.accountId] = (sum[h.accountId] ?? 0) + h.amount;
+      await this.store.applyTransactions(Object.entries(sum).map(([accountId, amount]) => ({ accountId, amount, reason: "R\xFCckbuchung nach Server-Neustart" })), { allowNegative: true }).catch((err) => console.error("[wallet] R\xFCckbuchung fehlgeschlagen", err));
+    }
+  }
+  /** Einsatz/Buy-in vom Konto auf den Tisch (alle oder keiner). */
+  async escrow(code, entries) {
+    const rows = entries.filter((e) => e.accountId && e.amount > 0);
+    if (!rows.length) return {};
+    const out = await this.transfer(rows.map((e) => ({ accountId: e.accountId, amount: -e.amount, reason: e.reason, game: e.game })));
+    await this.store.addHolds(code, rows);
+    return out;
+  }
+  /** Geld vom Tisch zurück aufs Konto; Sicherung freigeben (release: Konten oder 'all'). */
+  async payout(code, entries, release = "all") {
+    const out = await this.transfer(entries.filter((e) => e.accountId && e.amount > 0).map((e) => ({ accountId: e.accountId, amount: e.amount, reason: e.reason, game: e.game })));
+    await this.store.removeHolds(code, release === "all" ? null : release);
+    return out;
+  }
+  /** Bescheid geben, wenn sich ein Kontostand ändert (für Live-Anzeige). */
+  onChange(fn) {
+    this.listeners.add(fn);
+    return () => this.listeners.delete(fn);
+  }
+  #changed(balances) {
+    for (const fn of this.listeners) fn(balances);
+  }
+  #wrap(err) {
+    if (err instanceof StoreError) return new GameError(err.code, err.message);
+    return err;
+  }
+  async #newSession(accountId) {
+    const token = randomBytes3(24).toString("hex");
+    await this.store.putSession(hashToken(token), accountId);
+    return token;
+  }
+  async register(rawName, rawPin) {
+    const name = cleanName(rawName);
+    const pin = checkPin(rawPin);
+    if (await this.store.findAccountByName(name)) throw new GameError("NAME_TAKEN", "Diesen Namen gibt es schon \u2013 melde dich an oder nimm einen anderen.");
+    const salt = randomBytes3(16).toString("hex");
+    const acc2 = { id: randomBytes3(10).toString("hex"), name, nameLower: name.toLowerCase(), pinHash: await hashPin(pin, salt), salt, dailyDay: berlinDay(), failed: 0, lockedUntil: 0, createdAt: Date.now() };
+    try {
+      await this.store.insertAccount(acc2);
+      await this.store.applyTransactions([{ accountId: acc2.id, amount: WALLET.start, reason: "Startguthaben" }]);
+    } catch (err) {
+      throw this.#wrap(err);
+    }
+    const token = await this.#newSession(acc2.id);
+    return { account: publicAccount(await this.store.getAccount(acc2.id)), token, daily: 0 };
+  }
+  async login(rawName, rawPin) {
+    const acc2 = await this.store.findAccountByName(String(rawName ?? "").trim());
+    const pin = String(rawPin ?? "");
+    if (!acc2) throw new GameError("BAD_LOGIN", "Name oder PIN stimmt nicht.");
+    if (acc2.lockedUntil > Date.now()) {
+      const min = Math.ceil((acc2.lockedUntil - Date.now()) / 6e4);
+      throw new GameError("LOCKED", `Zu viele Fehlversuche \u2013 bitte in ${min} Min. nochmal.`);
+    }
+    const hash = Buffer.from(await hashPin(pin, acc2.salt), "hex");
+    const ok = hash.length === 32 && timingSafeEqual(hash, Buffer.from(acc2.pinHash, "hex"));
+    if (!ok) {
+      const failed = (acc2.failed ?? 0) + 1;
+      await this.store.updateAccount(acc2.id, failed >= MAX_FAILS ? { failed: 0, lockedUntil: Date.now() + LOCK_MS } : { failed });
+      throw new GameError("BAD_LOGIN", "Name oder PIN stimmt nicht.");
+    }
+    if (acc2.failed) await this.store.updateAccount(acc2.id, { failed: 0 });
+    const daily = await this.claimDaily(acc2.id);
+    const token = await this.#newSession(acc2.id);
+    return { account: publicAccount(await this.store.getAccount(acc2.id)), token, daily };
+  }
+  /** Gespeicherte Sitzung fortsetzen. */
+  async resume(token) {
+    if (!token) return null;
+    const id = await this.store.getSession(hashToken(token));
+    if (!id) return null;
+    const daily = await this.claimDaily(id);
+    const acc2 = await this.store.getAccount(id);
+    return acc2 ? { account: publicAccount(acc2), daily } : null;
+  }
+  async logout(token) {
+    if (token) await this.store.deleteSession(hashToken(token));
+  }
+  /** Einmal am Tag: +Bonus, und wer danach unter der Grenze liegt, wird aufgefüllt. */
+  async claimDaily(id) {
+    const acc2 = await this.store.getAccount(id);
+    if (!acc2) return 0;
+    const today = berlinDay();
+    if (acc2.dailyDay === today) return 0;
+    await this.store.updateAccount(id, { dailyDay: today });
+    const amount = Math.max(WALLET.daily, WALLET.floor - acc2.balance);
+    const out = await this.store.applyTransactions([{ accountId: id, amount, reason: acc2.balance + WALLET.daily < WALLET.floor ? "Tagesbonus + Auff\xFCllen" : "Tagesbonus" }]);
+    this.#changed(out);
+    return amount;
+  }
+  async account(id) {
+    const a = await this.store.getAccount(id);
+    return a ? publicAccount(a) : null;
+  }
+  async balanceOf(id) {
+    return (await this.store.getAccount(id))?.balance ?? 0;
+  }
+  async history(id, limit = 50) {
+    return this.store.listTransactions(id, Math.min(100, limit));
+  }
+  /** Buchungen – alle oder keine; schlägt fehl, wenn jemand zu wenig hat. */
+  async transfer(list) {
+    const clean = list.filter((t) => t && t.accountId && Number.isFinite(t.amount) && t.amount !== 0).map((t) => ({ ...t, amount: Math.round(t.amount) }));
+    if (!clean.length) return {};
+    try {
+      const out = await this.store.applyTransactions(clean);
+      this.#changed(out);
+      return out;
+    } catch (err) {
+      throw this.#wrap(err);
+    }
+  }
+  /**
+   * Nullsummen-Abrechnung (Schafkopf, Lügen): Verlierer zahlen höchstens, was sie haben;
+   * Gewinner bekommen anteilig weniger, falls jemand nicht voll zahlen kann. Es entsteht kein Geld.
+   * @param {{accountId:string, delta:number}[]} entries
+   * @returns {Promise<Record<string, number>>} tatsächlich gebuchte Beträge
+   */
+  async settle(entries, reason, game) {
+    const rows = entries.filter((e) => e.accountId && Number.isFinite(e.delta) && Math.round(e.delta) !== 0).map((e) => ({ ...e, delta: Math.round(e.delta) }));
+    if (!rows.length) return {};
+    const balances = {};
+    for (const r of rows) balances[r.accountId] ??= await this.balanceOf(r.accountId);
+    let paid = 0;
+    const applied = {};
+    for (const r of rows.filter((x) => x.delta < 0)) {
+      const amount = -Math.min(-r.delta, balances[r.accountId]);
+      applied[r.accountId] = (applied[r.accountId] ?? 0) + amount;
+      paid += -amount;
+    }
+    const owed = rows.filter((x) => x.delta > 0).reduce((s, x) => s + x.delta, 0);
+    const factor = owed > 0 ? Math.min(1, paid / owed) : 0;
+    let given = 0;
+    const winners = rows.filter((x) => x.delta > 0);
+    winners.forEach((r) => {
+      const amount = Math.floor(r.delta * factor);
+      applied[r.accountId] = (applied[r.accountId] ?? 0) + amount;
+      given += amount;
+    });
+    if (winners.length && paid - given > 0) applied[winners[0].accountId] += paid - given;
+    await this.transfer(Object.entries(applied).map(([accountId, amount]) => ({ accountId, amount, reason, game })));
+    return applied;
+  }
+  // ---------- Tisch-Sperre ----------
+  lockOf(accountId) {
+    return this.locks.get(accountId) ?? null;
+  }
+  lock(accountId, code) {
+    const cur = this.locks.get(accountId);
+    if (cur && cur !== code) throw new GameError("BUSY_TABLE", "Du sitzt schon an einem anderen Taler-Tisch.");
+    this.locks.set(accountId, code);
+  }
+  unlock(accountId, code) {
+    if (!code || this.locks.get(accountId) === code) this.locks.delete(accountId);
+  }
+};
+
 // src/app.js
-var __dirname = path.dirname(fileURLToPath(import.meta.url));
+var __dirname = path2.dirname(fileURLToPath(import.meta.url));
 var CLIENT_ORIGIN = process.env.CLIENT_ORIGIN?.split(",").map((s) => s.trim());
-function createLuegenServer({ clientDir, pauseMs, botTiming, chessAbandonMs } = {}) {
+function createLuegenServer({ clientDir, pauseMs, botTiming, chessAbandonMs, walletMemory = Boolean(process.env.NODE_TEST_CONTEXT), walletPauseMs } = {}) {
   const app = express2();
   const httpServer2 = createServer(app);
   const io = new Server(httpServer2, {
@@ -4659,27 +5602,36 @@ function createLuegenServer({ clientDir, pauseMs, botTiming, chessAbandonMs } = 
     pingInterval: 4e3,
     pingTimeout: 5e3
   });
-  const rooms = new RoomManager();
-  registerSocketHandlers(io, rooms, { pauseMs, botTiming, chessAbandonMs });
+  const wallet = new Wallet(createStore({ memory: walletMemory }));
+  wallet.ready = wallet.init().catch((err) => {
+    console.error("[wallet] Speicher nicht erreichbar:", err.message);
+    throw err;
+  });
+  wallet.ready.catch(() => {
+  });
+  if (!walletMemory) wallet.ready.then(() => console.log(`[wallet] Konten: ${process.env.DATABASE_URL ? "Datenbank" : wallet.persistent ? "Datei" : "nur bis zum n\xE4chsten Neustart (DATABASE_URL fehlt)"}`)).catch(() => {
+  });
+  const rooms = new RoomManager({ wallet });
+  registerSocketHandlers(io, rooms, { pauseMs, botTiming, chessAbandonMs, wallet, walletPauseMs });
   app.set("trust proxy", true);
   app.use(youtubeRouter());
   app.get("/health", (_req, res) => res.json({ ok: true, rooms: rooms.rooms.size }));
   if (clientDir) {
     const PUBLIC = ["manifest.webmanifest", "icon-192.png", "icon-512.png", "favicon.svg"];
-    for (const f of PUBLIC) app.get(`/${f}`, (_req, res) => res.sendFile(path.join(clientDir, f)));
-    app.get(/^(?!\/socket\.io).*/, (_req, res) => res.sendFile(path.join(clientDir, "index.html")));
-    return { app, httpServer: httpServer2, io, rooms };
+    for (const f of PUBLIC) app.get(`/${f}`, (_req, res) => res.sendFile(path2.join(clientDir, f)));
+    app.get(/^(?!\/socket\.io).*/, (_req, res) => res.sendFile(path2.join(clientDir, "index.html")));
+    return { app, httpServer: httpServer2, io, rooms, wallet };
   }
-  const clientDist = path.resolve(__dirname, "../../client/dist");
-  if (existsSync(clientDist)) {
+  const clientDist = path2.resolve(__dirname, "../../client/dist");
+  if (existsSync2(clientDist)) {
     app.use(express2.static(clientDist, { maxAge: "1h", index: false }));
-    app.get(/^(?!\/socket\.io).*/, (_req, res) => res.sendFile(path.join(clientDist, "index.html")));
+    app.get(/^(?!\/socket\.io).*/, (_req, res) => res.sendFile(path2.join(clientDist, "index.html")));
   }
-  return { app, httpServer: httpServer2, io, rooms };
+  return { app, httpServer: httpServer2, io, rooms, wallet };
 }
 
 // src/deploy-entry.js
-var dir = path2.dirname(fileURLToPath2(import.meta.url));
+var dir = path3.dirname(fileURLToPath2(import.meta.url));
 var PORT = Number(process.env.PORT ?? 3001);
 var { httpServer } = createLuegenServer({ clientDir: dir });
 httpServer.listen(PORT, () => console.log(`L\xFCgen l\xE4uft auf Port ${PORT}`));
