@@ -18,8 +18,9 @@ var SUITS = ["eichel", "gras", "herz", "schellen"];
 var RANKS = ["6", "7", "8", "9", "10", "U", "O", "K", "A"];
 var MIN_PLAYERS = 2;
 var MAX_PLAYERS = 7;
-var GAMES = { LUEGEN: "luegen", SCHAFKOPF: "schafkopf" };
-var GAME_MAX_PLAYERS = { luegen: 7, schafkopf: 4 };
+var GAMES = { LUEGEN: "luegen", SCHAFKOPF: "schafkopf", CHESS: "chess" };
+var GAME_MAX_PLAYERS = { luegen: 7, schafkopf: 4, chess: 2 };
+var GAME_LABELS = { luegen: "L\xFCgen", schafkopf: "Schafkopf", chess: "Schach" };
 var UNCLAIMABLE_RANK = "O";
 var CLAIM_RANKS = RANKS.filter((r) => r !== UNCLAIMABLE_RANK);
 var MAX_CARDS_PER_PLAY = 3;
@@ -64,12 +65,24 @@ var EVT = {
   GAME_REMATCH: "game:rematch",
   CHAT_SEND: "chat:send",
   LOBBY_LIST: "lobby:list",
+  CHESS_MOVE: "chess:move",
+  CHESS_RESIGN: "chess:resign",
+  CHESS_DRAW: "chess:draw",
+  CHESS_REMATCH: "chess:rematch",
+  PRESENCE_HELLO: "presence:hello",
+  // wer bin ich, was mache ich gerade
+  PRESENCE_LIST: "presence:list",
+  // wer ist gerade online
+  INVITE_SEND: "invite:send",
+  // Leute an meinen Tisch einladen
   // Server → Client
   ROOM_STATE: "room:state",
   GAME_EVENT: "game:event",
   KICKED: "room:kicked",
   CHAT_MESSAGE: "chat:message",
-  CHAT_HISTORY: "chat:history"
+  CHAT_HISTORY: "chat:history",
+  INVITE: "invite"
+  // Einladung an diesen Client
 };
 function nextRank(rank) {
   const i = RANKS.indexOf(rank);
@@ -152,6 +165,7 @@ var LuegenGame = class {
     this.winnerId = null;
     this.endReason = null;
     this.lastPickerId = null;
+    this.caughtStreak = {};
     this.phase = PHASES.PLAYING;
     this.seq = 0;
     this.discarded = [];
@@ -191,6 +205,7 @@ var LuegenGame = class {
         return { type: "out", playerId: confirmedOutId, place: this.finishOrder.length, ...this.#endInfo() };
       }
     }
+    if (this.lastPlay && this.lastPlay.playerId !== playerId) this.caughtStreak[this.lastPlay.playerId] = 0;
     const remaining = hand.filter((c) => !cardIds.includes(c.id));
     this.hands.set(playerId, remaining);
     this.pile.push(...cards);
@@ -241,7 +256,17 @@ var LuegenGame = class {
       event.outByQuads = loserId;
     }
     if (this.#checkEnd()) return { ...event, ...this.#endInfo() };
-    const starter = lied ? playerId : accusedId;
+    let starter = accusedId;
+    if (lied) {
+      const streak = (this.caughtStreak[accusedId] ?? 0) + 1;
+      event.caughtStreak = streak;
+      if (streak >= 3) {
+        starter = playerId;
+        this.caughtStreak[accusedId] = 0;
+        event.streakBroken = true;
+      } else this.caughtStreak[accusedId] = streak;
+    } else this.caughtStreak[accusedId] = 0;
+    if (!this.hands.has(starter)) starter = playerId;
     this.currentPlayerId = this.hands.get(starter).length > 0 ? starter : this.#nextActive(starter);
     return { ...event, nextPlayerId: this.currentPlayerId };
   }
@@ -1281,6 +1306,809 @@ function luegenDeltas(names, loserName, stake = LUEGEN_STAKE) {
   return deltas;
 }
 
+// ../shared/chess/board.js
+var WHITE = 0;
+var BLACK = 1;
+var PAWN = 1;
+var KNIGHT = 2;
+var BISHOP = 3;
+var ROOK = 4;
+var QUEEN = 5;
+var KING = 6;
+var BLACK_BIT = 8;
+var START_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+var F_CAPTURE = 1;
+var F_EP = 2;
+var F_CASTLE = 4;
+var F_DOUBLE = 8;
+var F_PROMO = 16;
+var mFrom = (m) => m & 127;
+var mTo = (m) => m >> 7 & 127;
+var mPromo = (m) => m >> 14 & 15;
+var mFlags = (m) => m >> 18;
+var encode = (from, to, promo, flags) => from | to << 7 | promo << 14 | flags << 18;
+var pieceType = (p) => p & 7;
+var pieceColor = (p) => p & BLACK_BIT ? BLACK : WHITE;
+var N_DIRS = [33, 31, 18, 14, -33, -31, -18, -14];
+var B_DIRS = [17, 15, -17, -15];
+var R_DIRS = [16, -16, 1, -1];
+var K_DIRS = [17, 15, -17, -15, 16, -16, 1, -1];
+var sq88 = (i) => i >> 3 << 4 | i & 7;
+var sqName = (s) => "abcdefgh"[s & 7] + ((s >> 4) + 1);
+var sqFromName = (n) => n.charCodeAt(1) - 49 << 4 | n.charCodeAt(0) - 97;
+var PIECE_CHARS = " pnbrqk";
+var charOf = (p) => {
+  const c = PIECE_CHARS[pieceType(p)];
+  return pieceColor(p) === WHITE ? c.toUpperCase() : c;
+};
+var CASTLE_MASK = new Uint8Array(128).fill(15);
+CASTLE_MASK[4] = 15 & ~3;
+CASTLE_MASK[0] = 15 & ~2;
+CASTLE_MASK[7] = 15 & ~1;
+CASTLE_MASK[116] = 15 & ~12;
+CASTLE_MASK[112] = 15 & ~8;
+CASTLE_MASK[119] = 15 & ~4;
+function prng(seed) {
+  let s = seed >>> 0;
+  return () => {
+    s = s + 1831565813 >>> 0;
+    let t = s;
+    t = Math.imul(t ^ t >>> 15, t | 1);
+    t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+    return (t ^ t >>> 14) >>> 0;
+  };
+}
+var rnd = prng(20261113);
+var Z_PIECE_HI = new Uint32Array(16 * 128);
+var Z_PIECE_LO = new Uint32Array(16 * 128);
+for (let i = 0; i < 16 * 128; i++) {
+  Z_PIECE_HI[i] = rnd();
+  Z_PIECE_LO[i] = rnd();
+}
+var Z_CASTLE_HI = Uint32Array.from({ length: 16 }, rnd);
+var Z_CASTLE_LO = Uint32Array.from({ length: 16 }, rnd);
+var Z_EP_HI = Uint32Array.from({ length: 8 }, rnd);
+var Z_EP_LO = Uint32Array.from({ length: 8 }, rnd);
+var Z_SIDE_HI = rnd();
+var Z_SIDE_LO = rnd();
+var MG_VAL = [0, 82, 337, 365, 477, 1025, 0];
+var EG_VAL = [0, 94, 281, 297, 512, 936, 0];
+var PHASE_INC = [0, 0, 1, 1, 2, 4, 0];
+var PST_MG = [
+  null,
+  [0, 0, 0, 0, 0, 0, 0, 0, 98, 134, 61, 95, 68, 126, 34, -11, -6, 7, 26, 31, 65, 56, 25, -20, -14, 13, 6, 21, 23, 12, 17, -23, -27, -2, -5, 12, 17, 6, 10, -25, -26, -4, -4, -10, 3, 3, 33, -12, -35, -1, -20, -23, -15, 24, 38, -22, 0, 0, 0, 0, 0, 0, 0, 0],
+  [-167, -89, -34, -49, 61, -97, -15, -107, -73, -41, 72, 36, 23, 62, 7, -17, -47, 60, 37, 65, 84, 129, 73, 44, -9, 17, 19, 53, 37, 69, 18, 22, -13, 4, 16, 13, 28, 19, 21, -8, -23, -9, 12, 10, 19, 17, 25, -16, -29, -53, -12, -3, -1, 18, -14, -19, -105, -21, -58, -33, -17, -28, -19, -23],
+  [-29, 4, -82, -37, -25, -42, 7, -8, -26, 16, -18, -13, 30, 59, 18, -47, -16, 37, 43, 40, 35, 50, 37, -2, -4, 5, 19, 50, 37, 37, 7, -2, -6, 13, 13, 26, 34, 12, 10, 4, 0, 15, 15, 15, 14, 27, 18, 10, 4, 15, 16, 0, 7, 21, 33, 1, -33, -3, -14, -21, -13, -12, -39, -21],
+  [32, 42, 32, 51, 63, 9, 31, 43, 27, 32, 58, 62, 80, 67, 26, 44, -5, 19, 26, 36, 17, 45, 61, 16, -24, -11, 7, 26, 24, 35, -8, -20, -36, -26, -12, -1, 9, -7, 6, -23, -45, -25, -16, -17, 3, 0, -5, -33, -44, -16, -20, -9, -1, 11, -6, -71, -19, -13, 1, 17, 16, 7, -37, -26],
+  [-28, 0, 29, 12, 59, 44, 43, 45, -24, -39, -5, 1, -16, 57, 28, 54, -13, -17, 7, 8, 29, 56, 47, 57, -27, -27, -16, -16, -1, 17, -2, 1, -9, -26, -9, -10, -2, -4, 3, -3, -14, 2, -11, -2, -5, 2, 14, 5, -35, -8, 11, 2, 8, 15, -3, 1, -1, -18, -9, 10, -15, -25, -31, -50],
+  [-65, 23, 16, -15, -56, -34, 2, 13, 29, -1, -20, -7, -8, -4, -38, -29, -9, 24, 2, -16, -20, 6, 22, -22, -17, -20, -12, -27, -30, -25, -14, -36, -49, -1, -27, -39, -46, -44, -33, -51, -14, -14, -22, -46, -44, -30, -15, -27, 1, 7, -8, -64, -43, -16, 9, 8, -15, 36, 12, -54, 8, -28, 24, 14]
+];
+var PST_EG = [
+  null,
+  [0, 0, 0, 0, 0, 0, 0, 0, 178, 173, 158, 134, 147, 132, 165, 187, 94, 100, 85, 67, 56, 53, 82, 84, 32, 24, 13, 5, -2, 4, 17, 17, 13, 9, -3, -7, -7, -8, 3, -1, 4, 7, -6, 1, 0, -5, -1, -8, 13, 8, 8, 10, 13, 0, 2, -7, 0, 0, 0, 0, 0, 0, 0, 0],
+  [-58, -38, -13, -28, -31, -27, -63, -99, -25, -8, -25, -2, -9, -25, -24, -52, -24, -20, 10, 9, -1, -9, -19, -41, -17, 3, 22, 22, 22, 11, 8, -18, -18, -6, 16, 25, 16, 17, 4, -18, -23, -3, -1, 15, 10, -3, -20, -22, -42, -20, -10, -5, -2, -20, -23, -44, -29, -51, -23, -15, -22, -18, -50, -64],
+  [-14, -21, -11, -8, -7, -9, -17, -24, -8, -4, 7, -12, -3, -13, -4, -14, 2, -8, 0, -1, -2, 6, 0, 4, -3, 9, 12, 9, 14, 10, 3, 2, -6, 3, 13, 19, 7, 10, -3, -9, -12, -3, 8, 10, 13, 3, -7, -15, -14, -18, -7, -1, 4, -9, -15, -27, -23, -9, -23, -5, -9, -16, -5, -17],
+  [13, 10, 18, 15, 12, 12, 8, 5, 11, 13, 13, 11, -3, 3, 8, 3, 7, 7, 7, 5, 4, -3, -5, -3, 4, 3, 13, 1, 2, 1, -1, 2, 3, 5, 8, 4, -5, -6, -8, -11, -4, 0, -5, -1, -7, -12, -8, -16, -6, -6, 0, 2, -9, -9, -11, -3, -9, 2, 3, -1, -5, -13, 4, -20],
+  [-9, 22, 22, 27, 27, 19, 10, 20, -17, 20, 32, 41, 58, 25, 30, 0, -20, 6, 9, 49, 47, 35, 19, 9, 3, 22, 24, 45, 57, 40, 57, 36, -18, 28, 19, 47, 31, 34, 39, 23, -16, -27, 15, 6, 9, 17, 10, 5, -22, -23, -30, -16, -16, -23, -36, -32, -33, -28, -22, -43, -5, -32, -20, -41],
+  [-74, -35, -18, -18, -11, 15, 4, -17, -12, 17, 14, 17, 17, 38, 23, 11, 10, 17, 23, 15, 20, 45, 44, 13, -8, 22, 24, 27, 26, 33, 26, 3, -18, -4, 21, 24, 27, 23, 9, -11, -19, -3, 11, 21, 23, 16, 7, -9, -27, -11, 4, 13, 14, 4, -5, -17, -53, -34, -21, -11, -28, -14, -24, -43]
+];
+var MG = new Int16Array(16 * 128);
+var EG = new Int16Array(16 * 128);
+for (let t = 1; t <= 6; t++) {
+  for (let i = 0; i < 64; i++) {
+    const s = sq88(i);
+    const rank = i >> 3;
+    const file = i & 7;
+    const wIdx = (7 - rank) * 8 + file;
+    const bIdx = rank * 8 + file;
+    MG[t * 128 + s] = MG_VAL[t] + PST_MG[t][wIdx];
+    EG[t * 128 + s] = EG_VAL[t] + PST_EG[t][wIdx];
+    MG[(t | BLACK_BIT) * 128 + s] = -(MG_VAL[t] + PST_MG[t][bIdx]);
+    EG[(t | BLACK_BIT) * 128 + s] = -(EG_VAL[t] + PST_EG[t][bIdx]);
+  }
+}
+var Position = class _Position {
+  constructor(fen = START_FEN) {
+    this.board = new Int8Array(128);
+    this.stack = [];
+    this.hashes = [];
+    this.load(fen);
+  }
+  load(fen) {
+    const [placement, side = "w", castling = "-", ep = "-", half = "0", full = "1"] = String(fen).trim().split(/\s+/);
+    const b = this.board;
+    b.fill(0);
+    this.kings = [-1, -1];
+    const rows = placement.split("/");
+    if (rows.length !== 8) throw new Error("FEN: 8 Reihen erwartet");
+    for (let r = 0; r < 8; r++) {
+      let f = 0;
+      for (const ch of rows[r]) {
+        if (ch >= "1" && ch <= "8") {
+          f += Number(ch);
+          continue;
+        }
+        const t = PIECE_CHARS.indexOf(ch.toLowerCase());
+        if (t < 1 || f > 7) throw new Error(`FEN: ung\xFCltiges Zeichen ${ch}`);
+        const color = ch === ch.toUpperCase() ? WHITE : BLACK;
+        const s = 7 - r << 4 | f;
+        b[s] = t | (color ? BLACK_BIT : 0);
+        if (t === KING) this.kings[color] = s;
+        f++;
+      }
+      if (f !== 8) throw new Error("FEN: Reihe hat nicht 8 Felder");
+    }
+    if (this.kings[0] < 0 || this.kings[1] < 0) throw new Error("FEN: beide K\xF6nige n\xF6tig");
+    this.turn = side === "b" ? BLACK : WHITE;
+    this.castling = (castling.includes("K") ? 1 : 0) | (castling.includes("Q") ? 2 : 0) | (castling.includes("k") ? 4 : 0) | (castling.includes("q") ? 8 : 0);
+    if (b[4] !== KING) this.castling &= ~3;
+    if (b[7] !== ROOK) this.castling &= ~1;
+    if (b[0] !== ROOK) this.castling &= ~2;
+    if (b[116] !== (KING | BLACK_BIT)) this.castling &= ~12;
+    if (b[119] !== (ROOK | BLACK_BIT)) this.castling &= ~4;
+    if (b[112] !== (ROOK | BLACK_BIT)) this.castling &= ~8;
+    this.ep = ep !== "-" ? sqFromName(ep) : -1;
+    this.halfmove = Number(half) || 0;
+    this.fullmove = Number(full) || 1;
+    this.stack = [];
+    this.#recompute();
+    this.hashes = [];
+  }
+  #recompute() {
+    let hi = 0;
+    let lo = 0;
+    let mg = 0;
+    let eg = 0;
+    let phase = 0;
+    for (let s = 0; s < 128; s++) {
+      if (s & 136) {
+        s += 7;
+        continue;
+      }
+      const p = this.board[s];
+      if (!p) continue;
+      hi ^= Z_PIECE_HI[p * 128 + s];
+      lo ^= Z_PIECE_LO[p * 128 + s];
+      mg += MG[p * 128 + s];
+      eg += EG[p * 128 + s];
+      phase += PHASE_INC[pieceType(p)];
+    }
+    hi ^= Z_CASTLE_HI[this.castling];
+    lo ^= Z_CASTLE_LO[this.castling];
+    if (this.ep >= 0) {
+      hi ^= Z_EP_HI[this.ep & 7];
+      lo ^= Z_EP_LO[this.ep & 7];
+    }
+    if (this.turn) {
+      hi ^= Z_SIDE_HI;
+      lo ^= Z_SIDE_LO;
+    }
+    this.hashHi = hi >>> 0;
+    this.hashLo = lo >>> 0;
+    this.mg = mg;
+    this.eg = eg;
+    this.phase = phase;
+  }
+  get hashKey() {
+    return this.hashHi * 4294967296 + this.hashLo;
+  }
+  fen() {
+    let out = "";
+    for (let r = 7; r >= 0; r--) {
+      let empty = 0;
+      for (let f = 0; f < 8; f++) {
+        const p = this.board[r << 4 | f];
+        if (!p) empty++;
+        else {
+          if (empty) out += empty;
+          empty = 0;
+          out += charOf(p);
+        }
+      }
+      if (empty) out += empty;
+      if (r) out += "/";
+    }
+    const c = this.castling;
+    const cs = (c & 1 ? "K" : "") + (c & 2 ? "Q" : "") + (c & 4 ? "k" : "") + (c & 8 ? "q" : "") || "-";
+    return `${out} ${this.turn ? "b" : "w"} ${cs} ${this.epForFen()} ${this.halfmove} ${this.fullmove}`;
+  }
+  /** En-passant-Feld nur angeben, wenn ein Schlag dort auch möglich ist (wie Lichess/chess.com). */
+  epForFen() {
+    if (this.ep < 0) return "-";
+    const pawn = PAWN | (this.turn ? BLACK_BIT : 0);
+    const from = this.ep + (this.turn ? 16 : -16);
+    for (const d of [-1, 1]) {
+      const s = from + d;
+      if (!(s & 136) && this.board[s] === pawn) return sqName(this.ep);
+    }
+    return "-";
+  }
+  /** Wird das Feld von der Farbe `by` angegriffen? */
+  attacked(sq, by) {
+    const b = this.board;
+    const cb = by ? BLACK_BIT : 0;
+    const pawn = PAWN | cb;
+    const pd = by ? 16 : -16;
+    let s = sq + pd - 1;
+    if (!(s & 136) && b[s] === pawn) return true;
+    s = sq + pd + 1;
+    if (!(s & 136) && b[s] === pawn) return true;
+    const knight = KNIGHT | cb;
+    for (let i = 0; i < 8; i++) {
+      s = sq + N_DIRS[i];
+      if (!(s & 136) && b[s] === knight) return true;
+    }
+    const king = KING | cb;
+    for (let i = 0; i < 8; i++) {
+      s = sq + K_DIRS[i];
+      if (!(s & 136) && b[s] === king) return true;
+    }
+    const bishop = BISHOP | cb;
+    const queen = QUEEN | cb;
+    for (let i = 0; i < 4; i++) {
+      const d = B_DIRS[i];
+      s = sq + d;
+      while (!(s & 136)) {
+        const p = b[s];
+        if (p) {
+          if (p === bishop || p === queen) return true;
+          break;
+        }
+        s += d;
+      }
+    }
+    const rook = ROOK | cb;
+    for (let i = 0; i < 4; i++) {
+      const d = R_DIRS[i];
+      s = sq + d;
+      while (!(s & 136)) {
+        const p = b[s];
+        if (p) {
+          if (p === rook || p === queen) return true;
+          break;
+        }
+        s += d;
+      }
+    }
+    return false;
+  }
+  inCheck(side = this.turn) {
+    return this.attacked(this.kings[side], side ^ 1);
+  }
+  /** Pseudolegale Züge (König darf danach im Schach stehen – makeMove prüft das). */
+  generate(out = [], capturesOnly = false) {
+    const b = this.board;
+    const us = this.turn;
+    const cb = us ? BLACK_BIT : 0;
+    const fwd = us ? -16 : 16;
+    const startRank = us ? 6 : 1;
+    const promoRank = us ? 0 : 7;
+    for (let from = 0; from < 128; from++) {
+      if (from & 136) {
+        from += 7;
+        continue;
+      }
+      const p = b[from];
+      if (!p || (p & BLACK_BIT) !== cb) continue;
+      const t = p & 7;
+      if (t === PAWN) {
+        const to = from + fwd;
+        for (const side of [-1, 1]) {
+          const c = to + side;
+          if (c & 136) continue;
+          const q = b[c];
+          if (q && (q & BLACK_BIT) !== cb) {
+            if (c >> 4 === promoRank) for (let pr = QUEEN; pr >= KNIGHT; pr--) out.push(encode(from, c, pr, F_CAPTURE | F_PROMO));
+            else out.push(encode(from, c, 0, F_CAPTURE));
+          } else if (c === this.ep) out.push(encode(from, c, 0, F_CAPTURE | F_EP));
+        }
+        if (!b[to]) {
+          if (to >> 4 === promoRank) {
+            if (capturesOnly) out.push(encode(from, to, QUEEN, F_PROMO));
+            else for (let pr = QUEEN; pr >= KNIGHT; pr--) out.push(encode(from, to, pr, F_PROMO));
+          } else if (!capturesOnly) {
+            out.push(encode(from, to, 0, 0));
+            if (from >> 4 === startRank && !b[to + fwd]) out.push(encode(from, to + fwd, 0, F_DOUBLE));
+          }
+        }
+        continue;
+      }
+      if (t === KNIGHT || t === KING) {
+        const dirs2 = t === KNIGHT ? N_DIRS : K_DIRS;
+        for (let i = 0; i < 8; i++) {
+          const to = from + dirs2[i];
+          if (to & 136) continue;
+          const q = b[to];
+          if (!q) {
+            if (!capturesOnly) out.push(encode(from, to, 0, 0));
+          } else if ((q & BLACK_BIT) !== cb) out.push(encode(from, to, 0, F_CAPTURE));
+        }
+        if (t === KING && !capturesOnly) this.#castles(out, from);
+        continue;
+      }
+      const dirs = t === BISHOP ? B_DIRS : t === ROOK ? R_DIRS : K_DIRS;
+      for (let i = 0; i < dirs.length; i++) {
+        const d = dirs[i];
+        let to = from + d;
+        while (!(to & 136)) {
+          const q = b[to];
+          if (!q) {
+            if (!capturesOnly) out.push(encode(from, to, 0, 0));
+          } else {
+            if ((q & BLACK_BIT) !== cb) out.push(encode(from, to, 0, F_CAPTURE));
+            break;
+          }
+          to += d;
+        }
+      }
+    }
+    return out;
+  }
+  #castles(out, from) {
+    const b = this.board;
+    const us = this.turn;
+    const them = us ^ 1;
+    if (us === WHITE && from === 4) {
+      if (this.castling & 1 && !b[5] && !b[6] && !this.attacked(4, them) && !this.attacked(5, them) && !this.attacked(6, them))
+        out.push(encode(4, 6, 0, F_CASTLE));
+      if (this.castling & 2 && !b[3] && !b[2] && !b[1] && !this.attacked(4, them) && !this.attacked(3, them) && !this.attacked(2, them))
+        out.push(encode(4, 2, 0, F_CASTLE));
+    } else if (us === BLACK && from === 116) {
+      if (this.castling & 4 && !b[117] && !b[118] && !this.attacked(116, them) && !this.attacked(117, them) && !this.attacked(118, them))
+        out.push(encode(116, 118, 0, F_CASTLE));
+      if (this.castling & 8 && !b[115] && !b[114] && !b[113] && !this.attacked(116, them) && !this.attacked(115, them) && !this.attacked(114, them))
+        out.push(encode(116, 114, 0, F_CASTLE));
+    }
+  }
+  #put(s, p) {
+    this.board[s] = p;
+    const i = p * 128 + s;
+    this.hashHi ^= Z_PIECE_HI[i];
+    this.hashLo ^= Z_PIECE_LO[i];
+    this.mg += MG[i];
+    this.eg += EG[i];
+    this.phase += PHASE_INC[p & 7];
+  }
+  #remove(s) {
+    const p = this.board[s];
+    this.board[s] = 0;
+    const i = p * 128 + s;
+    this.hashHi ^= Z_PIECE_HI[i];
+    this.hashLo ^= Z_PIECE_LO[i];
+    this.mg -= MG[i];
+    this.eg -= EG[i];
+    this.phase -= PHASE_INC[p & 7];
+    return p;
+  }
+  /** Zug ausführen. Gibt false zurück (und nimmt ihn zurück), wenn der eigene König danach im Schach steht. */
+  makeMove(m) {
+    const from = m & 127;
+    const to = m >> 7 & 127;
+    const flags = m >> 18;
+    const us = this.turn;
+    this.hashes.push(this.hashKey);
+    const undo = { m, captured: 0, castling: this.castling, ep: this.ep, halfmove: this.halfmove, hashHi: this.hashHi, hashLo: this.hashLo };
+    this.stack.push(undo);
+    this.hashHi ^= Z_CASTLE_HI[this.castling];
+    this.hashLo ^= Z_CASTLE_LO[this.castling];
+    if (this.ep >= 0) {
+      this.hashHi ^= Z_EP_HI[this.ep & 7];
+      this.hashLo ^= Z_EP_LO[this.ep & 7];
+    }
+    const p = this.#remove(from);
+    if (flags & F_EP) {
+      const cap = to + (us ? 16 : -16);
+      undo.captured = this.#remove(cap);
+    } else if (flags & F_CAPTURE) undo.captured = this.#remove(to);
+    this.#put(to, flags & F_PROMO ? m >> 14 & 15 | (us ? BLACK_BIT : 0) : p);
+    if (flags & F_CASTLE) {
+      if (to === 6) this.#put(5, this.#remove(7));
+      else if (to === 2) this.#put(3, this.#remove(0));
+      else if (to === 118) this.#put(117, this.#remove(119));
+      else if (to === 114) this.#put(115, this.#remove(112));
+    }
+    if ((p & 7) === KING) this.kings[us] = to;
+    this.castling &= CASTLE_MASK[from] & CASTLE_MASK[to];
+    this.ep = flags & F_DOUBLE ? from + (us ? -16 : 16) : -1;
+    this.halfmove = (p & 7) === PAWN || flags & F_CAPTURE ? 0 : this.halfmove + 1;
+    if (us === BLACK) this.fullmove++;
+    this.turn = us ^ 1;
+    this.hashHi ^= Z_CASTLE_HI[this.castling] ^ Z_SIDE_HI;
+    this.hashLo ^= Z_CASTLE_LO[this.castling] ^ Z_SIDE_LO;
+    if (this.ep >= 0) {
+      this.hashHi ^= Z_EP_HI[this.ep & 7];
+      this.hashLo ^= Z_EP_LO[this.ep & 7];
+    }
+    this.hashHi >>>= 0;
+    this.hashLo >>>= 0;
+    if (this.attacked(this.kings[us], us ^ 1)) {
+      this.unmakeMove();
+      return false;
+    }
+    return true;
+  }
+  unmakeMove() {
+    const undo = this.stack.pop();
+    this.hashes.pop();
+    const { m } = undo;
+    const from = m & 127;
+    const to = m >> 7 & 127;
+    const flags = m >> 18;
+    this.turn ^= 1;
+    const us = this.turn;
+    if (us === BLACK) this.fullmove--;
+    const moved = this.#remove(to);
+    this.#put(from, flags & F_PROMO ? PAWN | (us ? BLACK_BIT : 0) : moved);
+    if (flags & F_EP) this.#put(to + (us ? 16 : -16), undo.captured);
+    else if (undo.captured) this.#put(to, undo.captured);
+    if (flags & F_CASTLE) {
+      if (to === 6) this.#put(7, this.#remove(5));
+      else if (to === 2) this.#put(0, this.#remove(3));
+      else if (to === 118) this.#put(119, this.#remove(117));
+      else if (to === 114) this.#put(112, this.#remove(115));
+    }
+    if ((moved & 7) === KING) this.kings[us] = from;
+    this.castling = undo.castling;
+    this.ep = undo.ep;
+    this.halfmove = undo.halfmove;
+    this.hashHi = undo.hashHi;
+    this.hashLo = undo.hashLo;
+  }
+  /** Nullzug für die Engine (Seite wechselt, sonst nichts). */
+  makeNull() {
+    this.hashes.push(this.hashKey);
+    this.stack.push({ m: 0, nul: true, ep: this.ep, hashHi: this.hashHi, hashLo: this.hashLo, halfmove: this.halfmove });
+    if (this.ep >= 0) {
+      this.hashHi ^= Z_EP_HI[this.ep & 7];
+      this.hashLo ^= Z_EP_LO[this.ep & 7];
+    }
+    this.ep = -1;
+    this.turn ^= 1;
+    this.halfmove++;
+    this.hashHi = (this.hashHi ^ Z_SIDE_HI) >>> 0;
+    this.hashLo = (this.hashLo ^ Z_SIDE_LO) >>> 0;
+  }
+  unmakeNull() {
+    const u = this.stack.pop();
+    this.hashes.pop();
+    this.turn ^= 1;
+    this.ep = u.ep;
+    this.halfmove = u.halfmove;
+    this.hashHi = u.hashHi;
+    this.hashLo = u.hashLo;
+  }
+  legalMoves() {
+    const out = [];
+    for (const m of this.generate()) {
+      if (this.makeMove(m)) {
+        this.unmakeMove();
+        out.push(m);
+      }
+    }
+    return out;
+  }
+  hasLegalMove() {
+    for (const m of this.generate()) {
+      if (this.makeMove(m)) {
+        this.unmakeMove();
+        return true;
+      }
+    }
+    return false;
+  }
+  /** Wie oft kam die aktuelle Stellung schon vor (inkl. jetzt)? Nur seit dem letzten unumkehrbaren Zug. */
+  repetitions() {
+    const key2 = this.hashKey;
+    let n = 1;
+    const h = this.hashes;
+    for (let i = h.length - 2, k = 0; i >= 0 && k < this.halfmove - 1; i -= 2, k += 2) if (h[i] === key2) n++;
+    return n;
+  }
+  insufficientMaterial() {
+    let minors = 0;
+    const bishops = [];
+    for (let s = 0; s < 128; s++) {
+      if (s & 136) {
+        s += 7;
+        continue;
+      }
+      const t = this.board[s] & 7;
+      if (!t || t === KING) continue;
+      if (t === PAWN || t === ROOK || t === QUEEN) return false;
+      minors++;
+      if (t === BISHOP) bishops.push((s >> 4) + (s & 7) & 1);
+    }
+    if (minors <= 1) return true;
+    return bishops.length === minors && bishops.every((c) => c === bishops[0]);
+  }
+  /** Ergebnis der Stellung (ohne Uhr): null, oder { result: '1-0'|'0-1'|'1/2-1/2', reason }. */
+  outcome() {
+    if (!this.hasLegalMove()) {
+      if (this.inCheck()) return { result: this.turn === WHITE ? "0-1" : "1-0", reason: "checkmate" };
+      return { result: "1/2-1/2", reason: "stalemate" };
+    }
+    if (this.insufficientMaterial()) return { result: "1/2-1/2", reason: "material" };
+    if (this.halfmove >= 100) return { result: "1/2-1/2", reason: "fifty" };
+    if (this.repetitions() >= 3) return { result: "1/2-1/2", reason: "repetition" };
+    return null;
+  }
+  // ---------- Notation ----------
+  /** Zug → UCI (e2e4, e7e8q) */
+  static uci(m) {
+    const pr = mPromo(m);
+    return sqName(mFrom(m)) + sqName(mTo(m)) + (pr ? " pnbrqk"[pr] : "");
+  }
+  /** Zug (legal, in dieser Stellung) → SAN */
+  san(m, legal = this.legalMoves()) {
+    const from = mFrom(m);
+    const to = mTo(m);
+    const flags = mFlags(m);
+    const p = this.board[from];
+    const t = p & 7;
+    let s;
+    if (flags & F_CASTLE) s = (to & 7) === 6 ? "O-O" : "O-O-O";
+    else {
+      s = "";
+      if (t !== PAWN) {
+        s = " PNBRQK"[t];
+        const others = legal.filter((o) => o !== m && mTo(o) === to && this.board[mFrom(o)] === p);
+        if (others.length) {
+          const sameFile = others.some((o) => (mFrom(o) & 7) === (from & 7));
+          const sameRank = others.some((o) => mFrom(o) >> 4 === from >> 4);
+          if (!sameFile) s += "abcdefgh"[from & 7];
+          else if (!sameRank) s += (from >> 4) + 1;
+          else s += sqName(from);
+        }
+      } else if (flags & F_CAPTURE) s = "abcdefgh"[from & 7];
+      if (flags & F_CAPTURE) s += "x";
+      s += sqName(to);
+      if (flags & F_PROMO) s += "=" + " PNBRQK"[mPromo(m)];
+    }
+    if (this.makeMove(m)) {
+      if (this.inCheck()) s += this.hasLegalMove() ? "+" : "#";
+      this.unmakeMove();
+    }
+    return s;
+  }
+  /** UCI- oder SAN-Text → legaler Zug oder 0 */
+  parse(text) {
+    const legal = this.legalMoves();
+    const t = String(text).trim();
+    const uci = /^([a-h][1-8])([a-h][1-8])([nbrq])?$/i.exec(t);
+    if (uci) {
+      const from = sqFromName(uci[1].toLowerCase());
+      const to = sqFromName(uci[2].toLowerCase());
+      const pr = uci[3] ? " pnbrqk".indexOf(uci[3].toLowerCase()) : 0;
+      return legal.find((m) => mFrom(m) === from && mTo(m) === to && (mPromo(m) || 0) === (mFlags(m) & F_PROMO ? pr || QUEEN : 0)) ?? 0;
+    }
+    const clean = t.replace(/[+#!?]/g, "").replace(/0/g, "O");
+    return legal.find((m) => this.san(m, legal).replace(/[+#]/g, "") === clean) ?? 0;
+  }
+  /** Brett als Liste für die Anzeige: [{sq:'e2', type:'p', color:'w'}] */
+  pieces() {
+    const out = [];
+    for (let s = 0; s < 128; s++) {
+      if (s & 136) {
+        s += 7;
+        continue;
+      }
+      const p = this.board[s];
+      if (p) out.push({ sq: sqName(s), type: PIECE_CHARS[p & 7], color: p & BLACK_BIT ? "b" : "w" });
+    }
+    return out;
+  }
+  clone() {
+    const c = new _Position(this.fen());
+    c.hashes = [...this.hashes];
+    return c;
+  }
+};
+
+// ../shared/chess/ChessGame.js
+var ChessError = class extends Error {
+  constructor(code, message) {
+    super(message);
+    this.code = code;
+  }
+};
+function parseTimeControl(id) {
+  if (!id || id === "none") return null;
+  const m = /^(\d{1,3}(?:\.\d+)?)\+(\d{1,3})$/.exec(String(id));
+  if (!m) throw new ChessError("BAD_TIME", "Ung\xFCltige Zeitkontrolle.");
+  const min = Number(m[1]);
+  const inc = Number(m[2]);
+  if (!(min > 0 && min <= 180 && inc <= 180)) throw new ChessError("BAD_TIME", "Zeit zwischen 0,5 und 180 Minuten.");
+  return { initial: Math.round(min * 6e4), increment: inc * 1e3 };
+}
+var FIRST_MOVE_MS = 3e4;
+function canMate(pos, color) {
+  let minors = 0;
+  for (let s = 0; s < 128; s++) {
+    if (s & 136) {
+      s += 7;
+      continue;
+    }
+    const p = pos.board[s];
+    if (!p || (p & 8 ? BLACK : WHITE) !== color) continue;
+    const t = p & 7;
+    if (t === PAWN || t === ROOK || t === QUEEN) return true;
+    if (t === KNIGHT || t === BISHOP) minors++;
+  }
+  return minors >= 2;
+}
+var ChessGame = class {
+  /**
+   * @param {{white: string, black: string, time?: string, startFen?: string, now?: number}} opts
+   */
+  constructor({ white, black, time = "none", startFen, now = Date.now() }) {
+    this.kind = "chess";
+    this.white = white;
+    this.black = black;
+    this.order = [white, black];
+    this.timeControl = time;
+    this.tc = parseTimeControl(time);
+    this.startFen = startFen ?? new Position().fen();
+    this.pos = new Position(this.startFen);
+    this.moves = [];
+    this.phase = "playing";
+    this.result = null;
+    this.drawOffer = null;
+    this.seq = 0;
+    this.clock = this.tc ? { [WHITE]: this.tc.initial, [BLACK]: this.tc.initial } : null;
+    this.turnStarted = now;
+    this.clockRunning = false;
+  }
+  colorOf(playerId) {
+    return playerId === this.white ? WHITE : playerId === this.black ? BLACK : -1;
+  }
+  get currentPlayerId() {
+    return this.phase === "playing" ? this.order[this.pos.turn] : null;
+  }
+  /** Restzeit der Farbe jetzt (läuft nur für den Spieler am Zug). */
+  timeLeft(color, now = Date.now()) {
+    if (!this.clock) return null;
+    const base = this.clock[color];
+    if (this.phase !== "playing" || !this.clockRunning || this.pos.turn !== color) return base;
+    return base - (now - this.turnStarted);
+  }
+  /** Wann muss der Server spätestens nachsehen (Zeit/erster Zug)? ms ab jetzt oder null. */
+  nextDeadline(now = Date.now()) {
+    if (this.phase !== "playing") return null;
+    if (this.moves.length < 2) return Math.max(0, FIRST_MOVE_MS - (now - this.turnStarted));
+    if (!this.clock) return null;
+    return Math.max(0, this.timeLeft(this.pos.turn, now));
+  }
+  /** Zeit überschritten oder erster Zug verschlafen? Gibt ein Event zurück oder null. */
+  checkTime(now = Date.now()) {
+    if (this.phase !== "playing") return null;
+    if (this.moves.length < 2 && now - this.turnStarted >= FIRST_MOVE_MS) {
+      return this.#end({ result: "*", reason: "aborted", winner: null }, { by: this.order[this.pos.turn], firstMove: true });
+    }
+    if (!this.clock || !this.clockRunning) return null;
+    const color = this.pos.turn;
+    if (this.timeLeft(color, now) > 0) return null;
+    this.clock[color] = 0;
+    const other = color ^ 1;
+    if (!canMate(this.pos, other)) return this.#end({ result: "1/2-1/2", reason: "timeout_draw", winner: null });
+    return this.#end({ result: other === WHITE ? "1-0" : "0-1", reason: "timeout", winner: this.order[other] });
+  }
+  #end(result, extra = {}) {
+    this.phase = "over";
+    this.result = result;
+    this.drawOffer = null;
+    this.seq++;
+    return { type: "chess_over", ...result, ...extra };
+  }
+  /** Zug als UCI (e2e4, e7e8q) oder SAN. */
+  play(playerId, text, now = Date.now()) {
+    if (this.phase !== "playing") throw new ChessError("OVER", "Die Partie ist vorbei.");
+    const color = this.colorOf(playerId);
+    if (color < 0) throw new ChessError("NOT_PLAYER", "Du spielst in dieser Partie nicht mit.");
+    if (color !== this.pos.turn) throw new ChessError("NOT_YOUR_TURN", "Du bist nicht am Zug.");
+    const timeEvent = this.checkTime(now);
+    if (timeEvent) return timeEvent;
+    const m = this.pos.parse(String(text ?? ""));
+    if (!m) throw new ChessError("ILLEGAL", "Ung\xFCltiger Zug.");
+    const san = this.pos.san(m);
+    const uci = Position.uci(m);
+    if (this.clock && this.clockRunning) {
+      this.clock[color] = Math.max(0, this.clock[color] - (now - this.turnStarted)) + this.tc.increment;
+    }
+    this.pos.makeMove(m);
+    this.moves.push({ uci, san, from: sqName(mFrom(m)), to: sqName(mTo(m)), at: now, left: this.clock ? this.clock[color] : null });
+    if (this.moves.length >= 2) this.clockRunning = Boolean(this.clock);
+    this.turnStarted = now;
+    if (this.drawOffer && this.drawOffer !== playerId) this.drawOffer = null;
+    this.seq++;
+    const event = { type: "chess_move", playerId, san, uci, ply: this.moves.length };
+    const out = this.pos.outcome();
+    if (out) {
+      const winner = out.result === "1-0" ? this.white : out.result === "0-1" ? this.black : null;
+      return { ...event, over: this.#end({ ...out, winner }) };
+    }
+    return event;
+  }
+  resign(playerId) {
+    if (this.phase !== "playing") throw new ChessError("OVER", "Die Partie ist vorbei.");
+    const color = this.colorOf(playerId);
+    if (color < 0) throw new ChessError("NOT_PLAYER", "Du spielst nicht mit.");
+    if (this.moves.length < 2) return this.#end({ result: "*", reason: "aborted", winner: null }, { by: playerId });
+    const other = color ^ 1;
+    return this.#end({ result: other === WHITE ? "1-0" : "0-1", reason: "resign", winner: this.order[other] }, { by: playerId });
+  }
+  /** Spieler hat den Tisch endgültig verlassen. */
+  abandon(playerId) {
+    if (this.phase !== "playing") return null;
+    const color = this.colorOf(playerId);
+    if (color < 0) return null;
+    if (this.moves.length < 2) return this.#end({ result: "*", reason: "aborted", winner: null }, { by: playerId });
+    const other = color ^ 1;
+    return this.#end({ result: other === WHITE ? "1-0" : "0-1", reason: "abandon", winner: this.order[other] }, { by: playerId });
+  }
+  /** Remis: anbieten / annehmen / ablehnen */
+  draw(playerId, action) {
+    if (this.phase !== "playing") throw new ChessError("OVER", "Die Partie ist vorbei.");
+    if (this.colorOf(playerId) < 0) throw new ChessError("NOT_PLAYER", "Du spielst nicht mit.");
+    if (action === "offer") {
+      if (this.drawOffer && this.drawOffer !== playerId) return this.#end({ result: "1/2-1/2", reason: "agreement", winner: null });
+      if (this.moves.length < 2) throw new ChessError("TOO_EARLY", "Remis erst nach dem ersten Zug.");
+      this.drawOffer = playerId;
+      this.seq++;
+      return { type: "chess_draw_offer", playerId };
+    }
+    if (action === "accept") {
+      if (!this.drawOffer || this.drawOffer === playerId) throw new ChessError("NO_OFFER", "Es liegt kein Remisangebot vor.");
+      return this.#end({ result: "1/2-1/2", reason: "agreement", winner: null });
+    }
+    if (action === "decline") {
+      if (!this.drawOffer || this.drawOffer === playerId) return null;
+      this.drawOffer = null;
+      this.seq++;
+      return { type: "chess_draw_declined", playerId };
+    }
+    throw new ChessError("BAD_ACTION", "Unbekannte Aktion.");
+  }
+  /** PGN der Partie (für „Partie kopieren“). */
+  pgn(names = {}) {
+    const date = (/* @__PURE__ */ new Date()).toISOString().slice(0, 10).replace(/-/g, ".");
+    const res = this.result?.result ?? "*";
+    const head = [
+      `[Event "L\xFCgen-App Schach"]`,
+      `[Date "${date}"]`,
+      `[White "${names.white ?? "Wei\xDF"}"]`,
+      `[Black "${names.black ?? "Schwarz"}"]`,
+      `[Result "${res}"]`,
+      `[TimeControl "${this.tc ? `${this.tc.initial / 1e3}+${this.tc.increment / 1e3}` : "-"}"]`
+    ];
+    const body = this.moves.map((m, i) => i % 2 === 0 ? `${i / 2 + 1}. ${m.san}` : m.san).join(" ");
+    return `${head.join("\n")}
+
+${body} ${res}`.trim();
+  }
+  getStateFor(viewerId, now = Date.now()) {
+    const color = this.colorOf(viewerId);
+    return {
+      kind: "chess",
+      phase: this.phase,
+      white: this.white,
+      black: this.black,
+      myColor: color === WHITE ? "w" : color === BLACK ? "b" : null,
+      currentPlayerId: this.currentPlayerId,
+      turn: this.pos.turn === WHITE ? "w" : "b",
+      startFen: this.startFen,
+      fen: this.pos.fen(),
+      moves: this.moves.map((m) => ({ san: m.san, uci: m.uci, left: m.left })),
+      timeControl: this.timeControl,
+      clock: this.clock ? { w: this.timeLeft(WHITE, now), b: this.timeLeft(BLACK, now), running: this.phase === "playing" && this.clockRunning, serverNow: now } : null,
+      firstMoveLeft: this.phase === "playing" && this.moves.length < 2 ? Math.max(0, FIRST_MOVE_MS - (now - this.turnStarted)) : null,
+      drawOffer: this.drawOffer,
+      result: this.result,
+      check: this.pos.inCheck(),
+      seq: this.seq
+    };
+  }
+};
+
 // src/rooms/RoomManager.js
 var CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 var newId = () => randomBytes(8).toString("hex");
@@ -1298,7 +2126,8 @@ var Room = class {
     this.code = code;
     this.hostId = null;
     this.players = /* @__PURE__ */ new Map();
-    this.settings = { mode: MODES.SAME, public: true, game: GAMES.LUEGEN, skVariant: "lang", skPass: "ramsch", skExtras: defaultExtras() };
+    this.settings = { mode: MODES.SAME, public: true, game: GAMES.LUEGEN, skVariant: "lang", skPass: "ramsch", skExtras: defaultExtras(), chessTime: "5+0", chessColor: "random" };
+    this.chessWhite = null;
     this.ready = /* @__PURE__ */ new Set();
     this.scores = new ScoreBook();
     this.names = /* @__PURE__ */ new Map();
@@ -1426,11 +2255,25 @@ var RoomManager = class {
     return room;
   }
   /** Neuer Tisch – optional aus einem gespeicherten Tisch (Regeln, Computer-Gegner, Kasse). */
-  createRoom(name, restore) {
+  createRoom(name, restore, settings) {
     const room = new Room(this.#generateCode());
     this.rooms.set(room.code, room);
     if (restore && typeof restore === "object") room.scores = new ScoreBook(restore.scores);
-    const player = this.#addPlayer(room, name);
+    let player;
+    try {
+      player = this.#addPlayer(room, name);
+    } catch (err) {
+      this.rooms.delete(room.code);
+      throw err;
+    }
+    if (settings && typeof settings === "object" && !restore) {
+      try {
+        this.updateSettings(room, player.id, settings);
+      } catch (err) {
+        this.rooms.delete(room.code);
+        throw err;
+      }
+    }
     if (restore && typeof restore === "object") {
       try {
         this.updateSettings(room, player.id, { ...restore.settings ?? {} });
@@ -1491,7 +2334,8 @@ var RoomManager = class {
       room.game.replacePlayer(playerId, bot.id);
       room.personas[bot.id] = makePersona(bot.base, bot.difficulty);
       event = { type: "replaced", playerId, botId: bot.id, name: player.name, botName: bot.name };
-    } else if (room.game && room.game.phase === PHASES.PLAYING && room.game.kind !== "schafkopf") event = room.game.removePlayer(playerId);
+    } else if (room.game?.kind === "chess") event = room.game.abandon(playerId);
+    else if (room.game && room.game.phase === PHASES.PLAYING && room.game.kind !== "schafkopf") event = room.game.removePlayer(playerId);
     if (room.hostId === playerId) {
       const humans = room.humans;
       const nextHost = humans.find((p) => p.connected) ?? humans[0];
@@ -1508,6 +2352,7 @@ var RoomManager = class {
   addBot(room, playerId, difficulty = "normal") {
     this.#assertHost(room, playerId);
     if (room.phase !== PHASES.LOBBY) throw new GameError("ALREADY_STARTED", "Nur in der Lobby m\xF6glich.");
+    if (room.settings.game === GAMES.CHESS) throw new GameError("NO_BOTS", "Gegen den Computer spielst du Schach \xFCber \u201EGegen Computer\u201C.");
     if (room.players.size >= room.maxPlayers) throw new GameError("ROOM_FULL", `Raum ist voll (max. ${room.maxPlayers}).`);
     return this.#createBot(room, difficulty);
   }
@@ -1547,7 +2392,8 @@ var RoomManager = class {
     if (settings?.game !== void 0) {
       if (!Object.values(GAMES).includes(settings.game)) throw new GameError("BAD_GAME", "Unbekanntes Spiel.");
       if (room.players.size > GAME_MAX_PLAYERS[settings.game])
-        throw new GameError("TOO_MANY", `Schafkopf spielt man zu viert \u2013 erst ${room.players.size - GAME_MAX_PLAYERS[settings.game]} Spieler entfernen.`);
+        throw new GameError("TOO_MANY", `Zu viele Spieler am Tisch \u2013 erst ${room.players.size - GAME_MAX_PLAYERS[settings.game]} entfernen.`);
+      if (settings.game === GAMES.CHESS && [...room.players.values()].some((p) => p.bot)) throw new GameError("NO_BOTS", "Beim Schach erst die Computer-Gegner entfernen.");
       room.settings.game = settings.game;
     }
     if (settings?.skVariant !== void 0) {
@@ -1560,6 +2406,18 @@ var RoomManager = class {
     }
     if (settings?.skExtras && typeof settings.skExtras === "object") {
       for (const key2 of Object.keys(SK_EXTRAS)) if (settings.skExtras[key2] !== void 0) room.settings.skExtras[key2] = Boolean(settings.skExtras[key2]);
+    }
+    if (settings?.chessTime !== void 0) {
+      try {
+        parseTimeControl(settings.chessTime);
+      } catch {
+        throw new GameError("BAD_TIME", "Ung\xFCltige Zeitkontrolle.");
+      }
+      room.settings.chessTime = String(settings.chessTime);
+    }
+    if (settings?.chessColor !== void 0) {
+      if (!["white", "black", "random"].includes(settings.chessColor)) throw new GameError("BAD_COLOR", "Unbekannte Farbe.");
+      room.settings.chessColor = settings.chessColor;
     }
     if (settings?.mode !== void 0) {
       if (!Object.values(MODES).includes(settings.mode)) throw new GameError("BAD_MODE", "Unbekannter Modus.");
@@ -1574,7 +2432,8 @@ var RoomManager = class {
       players: r.players.size,
       max: r.maxPlayers,
       mode: r.settings.mode,
-      game: r.settings.game
+      game: r.settings.game,
+      ...r.settings.game === GAMES.CHESS && { chessTime: r.settings.chessTime, chessColor: r.settings.chessColor }
     })).slice(0, 50);
   }
   startGame(room, playerId) {
@@ -1582,6 +2441,7 @@ var RoomManager = class {
     if (room.active) throw new GameError("ALREADY_STARTED", "Das Spiel l\xE4uft bereits.");
     room.pauses.clear();
     room.ready.clear();
+    if (room.settings.game === GAMES.CHESS) return this.#startChess(room, false);
     if (room.settings.game === GAMES.SCHAFKOPF) {
       while (room.players.size < GAME_MAX_PLAYERS.schafkopf) this.#createBot(room, "normal");
       room.game = new SchafkopfGame([...room.players.values()], { variant: room.settings.skVariant, pass: room.settings.skPass, extras: room.settings.skExtras });
@@ -1599,6 +2459,32 @@ var RoomManager = class {
     );
     const g = room.game;
     return { type: "started", startPlayerId: g.currentPlayerId, quads: g.initialQuads, oberLoserId: g.endReason === "ober" ? g.loserId : null, ended: g.phase !== "playing" };
+  }
+  #startChess(room, swap) {
+    const humans = room.humans;
+    if (humans.length !== 2) throw new GameError("PLAYER_COUNT", "Schach spielt man zu zweit \u2013 warte auf deinen Gegner.");
+    const host = humans.find((p) => p.id === room.hostId) ?? humans[0];
+    const guest = humans.find((p) => p !== host);
+    let white;
+    if (swap && room.chessWhite) white = room.chessWhite === host.id ? guest : host;
+    else if (room.settings.chessColor === "white") white = host;
+    else if (room.settings.chessColor === "black") white = guest;
+    else white = randomInt2(2) ? host : guest;
+    const black = white === host ? guest : host;
+    room.chessWhite = white.id;
+    room.game = new ChessGame({ white: white.id, black: black.id, time: room.settings.chessTime });
+    return { type: "chess_start", white: white.id, black: black.id, time: room.settings.chessTime };
+  }
+  /** Schach: Revanche – sobald beide wollen, neue Partie mit getauschten Farben. */
+  chessRematch(room, playerId) {
+    const g = room.game;
+    if (g?.kind !== "chess" || g.phase !== "over") throw new GameError("NOT_OVER", "Die Partie l\xE4uft noch.");
+    if (!g.order.includes(playerId)) throw new GameError("NOT_PLAYER", "Du spielst nicht mit.");
+    room.ready.add(playerId);
+    const waiting = room.humans.filter((p) => !room.ready.has(p.id));
+    if (waiting.length) return { type: "chess_rematch_offer", playerId };
+    room.ready.clear();
+    return this.#startChess(room, true);
   }
   backToLobby(room, playerId) {
     this.#assertHost(room, playerId);
@@ -1854,6 +2740,8 @@ function skDecide(view, me, persona = {}) {
 }
 
 // src/socket/handlers.js
+var CHESS_ABANDON_MS = 60 * 1e3;
+var INVITE_COOLDOWN_MS = 15 * 1e3;
 var GRACE_MS = {
   [PHASES.LOBBY]: 60 * 1e3,
   [PHASES.PLAYING]: 3 * 60 * 1e3,
@@ -1862,13 +2750,47 @@ var GRACE_MS = {
 var DEFAULT_PAUSE_MS = 10 * 1e3;
 var RATE_LIMIT = { windowMs: 2e3, max: 30 };
 var BOT_TIMING = { min: 900, max: 1700, pending: [1400, 2200], first: [1600, 2300], afterReveal: 3800, afterTrick: 1500 };
-function registerSocketHandlers(io, rooms, { pauseMs = DEFAULT_PAUSE_MS, botTiming = BOT_TIMING } = {}) {
+function registerSocketHandlers(io, rooms, { pauseMs = DEFAULT_PAUSE_MS, botTiming = BOT_TIMING, chessAbandonMs = CHESS_ABANDON_MS } = {}) {
+  const presence = /* @__PURE__ */ new Map();
+  function scheduleChessTimer(room) {
+    clearTimeout(room.chessTimer);
+    const game = room.game;
+    if (game?.kind !== "chess" || !rooms.rooms.has(room.code)) return;
+    const wait = game.nextDeadline();
+    if (wait == null) return;
+    room.chessTimer = setTimeout(() => {
+      if (room.game !== game) return;
+      const ev = game.checkTime();
+      if (ev) {
+        emitEvent(room, ev);
+        broadcastState(room);
+      } else scheduleChessTimer(room);
+    }, wait + 25);
+    room.chessTimer.unref?.();
+  }
+  function chessAction(room, fn) {
+    if (room.game?.kind !== "chess") throw new GameError("NOT_PLAYING", "Hier l\xE4uft keine Schachpartie.");
+    let event;
+    try {
+      event = fn(room.game);
+    } catch (err) {
+      if (err instanceof ChessError) throw new GameError(err.code, err.message);
+      throw err;
+    }
+    if (event?.over) {
+      const { over, ...move } = event;
+      emitEvent(room, move);
+      emitEvent(room, over);
+    } else emitEvent(room, event);
+    broadcastState(room);
+  }
   function broadcastState(room) {
     rooms.recordIfDone(room);
     for (const player of room.players.values()) {
       if (player.socketId) io.to(player.socketId).emit(EVT.ROOM_STATE, room.stateFor(player.id));
     }
-    scheduleBot(room);
+    if (room.game?.kind === "chess") scheduleChessTimer(room);
+    else scheduleBot(room);
   }
   function emitEvent(room, event) {
     if (!event) return;
@@ -1997,6 +2919,11 @@ function registerSocketHandlers(io, rooms, { pauseMs = DEFAULT_PAUSE_MS, botTimi
       player.autoplay = false;
       emitEvent(room, { type: "took_over", playerId: player.id, name: player.name });
     }
+    if (player.abandonTimer) {
+      clearTimeout(player.abandonTimer);
+      player.abandonTimer = null;
+      emitEvent(room, { type: "reconnected", playerId: player.id });
+    }
     if (room.pauses.delete(player.id)) {
       clearTimeout(player.pauseTimer);
       emitEvent(room, { type: "reconnected", playerId: player.id });
@@ -2060,9 +2987,9 @@ function registerSocketHandlers(io, rooms, { pauseMs = DEFAULT_PAUSE_MS, botTimi
   }
   io.on("connection", (socket) => {
     socket.data = {};
-    on(socket, EVT.ROOM_CREATE, ({ name, restore }) => {
+    on(socket, EVT.ROOM_CREATE, ({ name, restore, settings }) => {
       leaveCurrent(socket);
-      const { room, player } = rooms.createRoom(name, restore);
+      const { room, player } = rooms.createRoom(name, restore, settings);
       attach(socket, room, player);
       broadcastState(room);
       return sessionPayload(room, player);
@@ -2178,6 +3105,84 @@ function registerSocketHandlers(io, rooms, { pauseMs = DEFAULT_PAUSE_MS, botTimi
       broadcastState(room);
       return {};
     });
+    on(socket, EVT.CHESS_MOVE, ({ move }) => {
+      const { room, player } = ctx(socket);
+      chessAction(room, (g) => g.play(player.id, String(move ?? "").slice(0, 10)));
+      return {};
+    });
+    on(socket, EVT.CHESS_RESIGN, () => {
+      const { room, player } = ctx(socket);
+      chessAction(room, (g) => g.resign(player.id));
+      return {};
+    });
+    on(socket, EVT.CHESS_DRAW, ({ action }) => {
+      const { room, player } = ctx(socket);
+      chessAction(room, (g) => g.draw(player.id, String(action)));
+      return {};
+    });
+    on(socket, EVT.CHESS_REMATCH, () => {
+      const { room, player } = ctx(socket);
+      emitEvent(room, rooms.chessRematch(room, player.id));
+      broadcastState(room);
+      return {};
+    });
+    on(socket, EVT.PRESENCE_HELLO, ({ cid, name, activity }) => {
+      const clean = (v, n) => String(v ?? "").replace(/[\u0000-\u001f\u007f<>]/g, "").trim().slice(0, n);
+      const id = clean(cid, 40);
+      if (!id) throw new GameError("BAD_ID", "Ung\xFCltige Kennung.");
+      presence.set(socket.id, { cid: id, name: clean(name, 20) || "Gast", activity: clean(activity, 60) || "Im Men\xFC" });
+      return {};
+    });
+    on(socket, EVT.PRESENCE_LIST, () => {
+      const me = presence.get(socket.id);
+      const byCid = /* @__PURE__ */ new Map();
+      for (const [sid, p] of presence) {
+        if (me && p.cid === me.cid) continue;
+        const s2 = io.sockets.sockets.get(sid);
+        if (!s2) continue;
+        const room = s2.data?.code ? rooms.rooms.get(s2.data.code) : null;
+        let status = p.activity;
+        let busy = false;
+        if (room) {
+          const label = GAME_LABELS[room.settings.game] ?? "Spiel";
+          busy = room.phase !== PHASES.LOBBY;
+          status = busy ? `Spielt ${label}` : `Wartet am ${label}-Tisch`;
+        }
+        const prev = byCid.get(p.cid);
+        if (!prev || prev.busy && !busy) byCid.set(p.cid, { cid: p.cid, name: room?.players.get(s2.data.playerId)?.name ?? p.name, status, busy, sameRoom: Boolean(room && room.code === socket.data?.code) });
+      }
+      return { users: [...byCid.values()].filter((u) => !u.sameRoom).sort((a, b) => a.busy - b.busy || a.name.localeCompare(b.name)).slice(0, 100) };
+    });
+    on(socket, EVT.INVITE_SEND, ({ cids, all }) => {
+      const { room, player } = ctx(socket);
+      if (room.phase !== PHASES.LOBBY) throw new GameError("ALREADY_STARTED", "Einladen geht nur, solange der Tisch wartet.");
+      if (room.players.size >= room.maxPlayers) throw new GameError("ROOM_FULL", "Der Tisch ist schon voll.");
+      const wanted = all ? null : new Set((Array.isArray(cids) ? cids : []).map(String).slice(0, 50));
+      const me = presence.get(socket.id);
+      room.invited ??= /* @__PURE__ */ new Map();
+      const now = Date.now();
+      const reached = /* @__PURE__ */ new Set();
+      for (const [sid, p] of presence) {
+        if (me && p.cid === me.cid) continue;
+        if (wanted && !wanted.has(p.cid)) continue;
+        const s2 = io.sockets.sockets.get(sid);
+        if (!s2 || s2.data?.code === room.code) continue;
+        if (all && s2.data?.code && rooms.rooms.get(s2.data.code)?.phase !== PHASES.LOBBY) continue;
+        const last = room.invited.get(p.cid) ?? 0;
+        if (now - last < INVITE_COOLDOWN_MS && !reached.has(p.cid)) continue;
+        room.invited.set(p.cid, now);
+        reached.add(p.cid);
+        s2.emit(EVT.INVITE, {
+          code: room.code,
+          from: player.name,
+          game: room.settings.game,
+          label: GAME_LABELS[room.settings.game] ?? "Spiel",
+          ...room.settings.game === "chess" && { chessTime: room.settings.chessTime },
+          at: now
+        });
+      }
+      return { sent: reached.size };
+    });
     on(socket, EVT.CHAT_SEND, ({ text }) => {
       const { room, player } = ctx(socket);
       const clean = String(text ?? "").replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim().slice(0, CHAT_MAX_LENGTH);
@@ -2195,6 +3200,7 @@ function registerSocketHandlers(io, rooms, { pauseMs = DEFAULT_PAUSE_MS, botTimi
       return {};
     });
     socket.on("disconnect", () => {
+      presence.delete(socket.id);
       const { code, playerId } = socket.data ?? {};
       if (!code) return;
       const room = rooms.rooms.get(code);
@@ -2202,7 +3208,20 @@ function registerSocketHandlers(io, rooms, { pauseMs = DEFAULT_PAUSE_MS, botTimi
       if (!player || player.socketId !== socket.id) return;
       player.connected = false;
       player.socketId = null;
-      if (room.active && room.game.order.includes(player.id)) {
+      if (room.game?.kind === "chess" && room.game.phase === "playing" && room.game.order.includes(player.id)) {
+        emitEvent(room, { type: "disconnected", playerId: player.id, name: player.name, pauseMs: chessAbandonMs, chess: true });
+        clearTimeout(player.abandonTimer);
+        player.abandonTimer = setTimeout(() => {
+          player.abandonTimer = null;
+          if (player.connected || room.game?.kind !== "chess") return;
+          const ev = room.game.abandon(player.id);
+          if (ev) {
+            emitEvent(room, ev);
+            broadcastState(room);
+          }
+        }, chessAbandonMs);
+        player.abandonTimer.unref?.();
+      } else if (room.active && room.game.order.includes(player.id)) {
         room.pauses.set(player.id, Date.now() + pauseMs);
         emitEvent(room, { type: "disconnected", playerId: player.id, name: player.name, pauseMs });
         clearTimeout(player.pauseTimer);
@@ -2326,7 +3345,7 @@ function youtubeRouter() {
 // src/app.js
 var __dirname = path.dirname(fileURLToPath(import.meta.url));
 var CLIENT_ORIGIN = process.env.CLIENT_ORIGIN?.split(",").map((s) => s.trim());
-function createLuegenServer({ clientDir, pauseMs, botTiming } = {}) {
+function createLuegenServer({ clientDir, pauseMs, botTiming, chessAbandonMs } = {}) {
   const app = express2();
   const httpServer2 = createServer(app);
   const io = new Server(httpServer2, {
@@ -2337,7 +3356,7 @@ function createLuegenServer({ clientDir, pauseMs, botTiming } = {}) {
     pingTimeout: 5e3
   });
   const rooms = new RoomManager();
-  registerSocketHandlers(io, rooms, { pauseMs, botTiming });
+  registerSocketHandlers(io, rooms, { pauseMs, botTiming, chessAbandonMs });
   app.set("trust proxy", true);
   app.use(youtubeRouter());
   app.get("/health", (_req, res) => res.json({ ok: true, rooms: rooms.rooms.size }));

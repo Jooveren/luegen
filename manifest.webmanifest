@@ -1,7 +1,7 @@
 {
-  "name": "Lügen – Schafkopf-Blatt",
-  "short_name": "Lügen",
-  "description": "Das Wirtshaus-Kartenspiel mit Schafkopf-Blatt – gegen den Computer oder online mit Freunden.",
+  "name": "Games",
+  "short_name": "Games",
+  "description": "Lügen, Schafkopf, Schach und Mini-Spiele – gegen den Computer oder online mit Freunden.",
   "start_url": "/",
   "display": "fullscreen",
   "background_color": "#2f5e1f",
