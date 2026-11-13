@@ -18,9 +18,13 @@ var SUITS = ["eichel", "gras", "herz", "schellen"];
 var RANKS = ["6", "7", "8", "9", "10", "U", "O", "K", "A"];
 var MIN_PLAYERS = 2;
 var MAX_PLAYERS = 7;
-var GAMES = { LUEGEN: "luegen", SCHAFKOPF: "schafkopf", CHESS: "chess" };
-var GAME_MAX_PLAYERS = { luegen: 7, schafkopf: 4, chess: 2 };
-var GAME_LABELS = { luegen: "L\xFCgen", schafkopf: "Schafkopf", chess: "Schach" };
+var GAMES = { LUEGEN: "luegen", SCHAFKOPF: "schafkopf", CHESS: "chess", POKER: "poker", BLACKJACK: "blackjack" };
+var GAME_MAX_PLAYERS = { luegen: 7, schafkopf: 4, chess: 2, poker: 9, blackjack: 7 };
+var GAME_LABELS = { luegen: "L\xFCgen", schafkopf: "Schafkopf", chess: "Schach", poker: "Poker", blackjack: "Blackjack" };
+var POKER_CHIPS = [500, 1e3, 2e3, 5e3];
+var POKER_BLINDS = ["5/10", "10/20", "25/50", "50/100"];
+var TURN_SECONDS = [15, 30, 60, 0];
+var BJ_DECKS = [1, 2, 6, 8];
 var UNCLAIMABLE_RANK = "O";
 var CLAIM_RANKS = RANKS.filter((r) => r !== UNCLAIMABLE_RANK);
 var MAX_CARDS_PER_PLAY = 3;
@@ -65,6 +69,11 @@ var EVT = {
   GAME_REMATCH: "game:rematch",
   CHAT_SEND: "chat:send",
   LOBBY_LIST: "lobby:list",
+  POKER_ACT: "poker:act",
+  POKER_SHOW: "poker:show",
+  BJ_BET: "bj:bet",
+  BJ_ACT: "bj:act",
+  BJ_INSURE: "bj:insure",
   CHESS_MOVE: "chess:move",
   CHESS_RESIGN: "chess:resign",
   CHESS_DRAW: "chess:draw",
@@ -130,7 +139,7 @@ function shuffle(cards, rand = randomInt) {
 }
 function deal(cards, playerIds) {
   const hands = new Map(playerIds.map((id) => [id, []]));
-  cards.forEach((card, i) => hands.get(playerIds[i % playerIds.length]).push(card));
+  cards.forEach((card2, i) => hands.get(playerIds[i % playerIds.length]).push(card2));
   return hands;
 }
 
@@ -303,9 +312,9 @@ var LuegenGame = class {
     const receivers = this.order.filter((id) => this.hands.get(id).length > 0);
     const given = {};
     if (receivers.length) {
-      for (const card of shuffle(hand, this.rand)) {
+      for (const card2 of shuffle(hand, this.rand)) {
         const id = receivers[this.rand(receivers.length)];
-        this.hands.get(id).push(card);
+        this.hands.get(id).push(card2);
         given[id] = (given[id] ?? 0) + 1;
       }
     } else this.pile.unshift(...hand);
@@ -577,23 +586,23 @@ function trumpSuitOf(contract) {
   if (m.trumpSuit) return m.trumpSuit;
   return m.suit ? contract.suit : null;
 }
-function isTrump(card, contract) {
+function isTrump(card2, contract) {
   const m = meta(contract);
   if (m.bettel) return false;
-  if (m.lords.includes(card.rank)) return true;
+  if (m.lords.includes(card2.rank)) return true;
   const ts = trumpSuitOf(contract);
-  return ts !== null && card.suit === ts;
+  return ts !== null && card2.suit === ts;
 }
-function plainPower(card, contract) {
-  return (meta(contract).bettel ? BETTEL_ORDER : PLAIN_ORDER)[card.rank] ?? 0;
+function plainPower(card2, contract) {
+  return (meta(contract).bettel ? BETTEL_ORDER : PLAIN_ORDER)[card2.rank] ?? 0;
 }
-function trumpPower(card, contract) {
-  if (!isTrump(card, contract)) return -1;
+function trumpPower(card2, contract) {
+  if (!isTrump(card2, contract)) return -1;
   const { lords } = meta(contract);
-  if (lords.includes(card.rank)) return (lords === "OU" && card.rank === "U" ? 30 : 40) + SUIT_ORDER[card.suit];
-  return 20 + plainPower(card, contract);
+  if (lords.includes(card2.rank)) return (lords === "OU" && card2.rank === "U" ? 30 : 40) + SUIT_ORDER[card2.suit];
+  return 20 + plainPower(card2, contract);
 }
-var followSuit = (card, contract) => isTrump(card, contract) ? "trumpf" : card.suit;
+var followSuit = (card2, contract) => isTrump(card2, contract) ? "trumpf" : card2.suit;
 function beats(a, b, led, contract) {
   const ta = trumpPower(a, contract);
   const tb = trumpPower(b, contract);
@@ -976,29 +985,29 @@ var SchafkopfGame = class _SchafkopfGame {
   play(playerId, cardId) {
     this.#assertTurn(playerId, SK_PHASES.PLAYING);
     const hand = this.hands.get(playerId);
-    const card = hand.find((c2) => c2.id === cardId);
-    if (!card) throw new GameError("NOT_IN_HAND", "Diese Karte hast du nicht.");
+    const card2 = hand.find((c2) => c2.id === cardId);
+    if (!card2) throw new GameError("NOT_IN_HAND", "Diese Karte hast du nicht.");
     const c = this.contract;
-    if (!this.legalFor(playerId).includes(card)) {
-      if (c?.calledSuit && c.partnerId === playerId && !this.searched && card.suit === c.calledSuit && card.rank === "A")
+    if (!this.legalFor(playerId).includes(card2)) {
+      if (c?.calledSuit && c.partnerId === playerId && !this.searched && card2.suit === c.calledSuit && card2.rank === "A")
         throw new GameError("SAU_HOLD", "Die gerufene Sau darfst du nicht abwerfen.");
       if (this.trick.length) throw new GameError("MUST_FOLLOW", "Du musst bedienen.");
       throw new GameError("MUST_LEAD_SAU", "Die Ruffarbe darfst du nur mit der Sau anspielen (Davonlaufen erst ab 4 Karten).");
     }
-    const event = { type: "sk_play", playerId, card };
-    if (c?.calledSuit && !isTrump(card, c) && card.suit === c.calledSuit) {
-      if (!this.trick.length && !this.searched && playerId === c.partnerId && card.rank !== "A") {
+    const event = { type: "sk_play", playerId, card: card2 };
+    if (c?.calledSuit && !isTrump(card2, c) && card2.suit === c.calledSuit) {
+      if (!this.trick.length && !this.searched && playerId === c.partnerId && card2.rank !== "A") {
         this.ranAway = true;
         this.partnerRevealed = true;
         event.ranAway = true;
       }
-      if (card.rank === "A") {
+      if (card2.rank === "A") {
         this.partnerRevealed = true;
         event.sau = true;
       }
     }
-    hand.splice(hand.indexOf(card), 1);
-    this.trick.push({ playerId, card });
+    hand.splice(hand.indexOf(card2), 1);
+    this.trick.push({ playerId, card: card2 });
     this.seq += 1;
     if (this.trick.length < SK_PLAYERS) {
       this.turn = (this.turn + 1) % SK_PLAYERS;
@@ -1027,12 +1036,12 @@ var SchafkopfGame = class _SchafkopfGame {
     const c = this.contract;
     const order = trumpOrder(c, this.variant);
     if (!order.length) return 0;
-    const holder = (card) => this.order.find((id) => this.dealt.get(id).some((x) => x.id === card.id));
+    const holder = (card2) => this.order.find((id) => this.dealt.get(id).some((x) => x.id === card2.id));
     const side = (id) => this.#team(id);
     const first = side(holder(order[0]));
     let n = 0;
-    for (const card of order) {
-      if (side(holder(card)) !== first) break;
+    for (const card2 of order) {
+      if (side(holder(card2)) !== first) break;
       n += 1;
     }
     return n >= laufendeMin(c) ? n : 0;
@@ -2109,7 +2118,947 @@ ${body} ${res}`.trim();
   }
 };
 
+// ../shared/casino/cards.js
+var RANKS2 = ["2", "3", "4", "5", "6", "7", "8", "9", "T", "J", "Q", "K", "A"];
+var SUITS2 = ["s", "h", "d", "c"];
+var card = (id) => ({ id, rank: id[0], suit: id[1] });
+function newDeck(decks = 1) {
+  const out = [];
+  for (let d = 0; d < decks; d++) for (const s of SUITS2) for (const r of RANKS2) out.push(card(r + s));
+  return out;
+}
+function shuffle2(arr, rand) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = rand ? Math.floor(rand() * (i + 1)) : randomInt(i + 1);
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+var rankValue = (r) => RANKS2.indexOf(r) + 2;
+var HAND_NAMES = ["H\xF6chste Karte", "Ein Paar", "Zwei Paare", "Drilling", "Stra\xDFe", "Flush", "Full House", "Vierling", "Straight Flush", "Royal Flush"];
+function evaluate(cards) {
+  const n = cards.length;
+  const vals = cards.map((c) => rankValue(c.rank));
+  const bySuit = { s: [], h: [], d: [], c: [] };
+  cards.forEach((c, i) => bySuit[c.suit].push(i));
+  const count = new Array(15).fill(0);
+  vals.forEach((v) => count[v]++);
+  const pack = (cat, ks) => {
+    let s = cat;
+    for (let i = 0; i < 5; i++) s = s * 15 + (ks[i] ?? 0);
+    return s;
+  };
+  const straightHigh = (present) => {
+    const has = new Array(15).fill(false);
+    for (const v of present) has[v] = true;
+    has[1] = has[14];
+    for (let h = 14; h >= 5; h--) {
+      let ok = true;
+      for (let k2 = 0; k2 < 5; k2++) if (!has[h - k2]) ok = false;
+      if (ok) return h;
+    }
+    return 0;
+  };
+  const pickByValue = (wanted, from = cards.map((_, i) => i)) => {
+    const used = /* @__PURE__ */ new Set();
+    const out = [];
+    for (const v of wanted) {
+      const idx = from.find((i) => !used.has(i) && (vals[i] === v || v === 1 && vals[i] === 14));
+      if (idx !== void 0) {
+        used.add(idx);
+        out.push(cards[idx].id);
+      }
+    }
+    return out;
+  };
+  let flushSuit = null;
+  for (const s of SUITS2) if (bySuit[s].length >= 5) flushSuit = s;
+  if (flushSuit) {
+    const idx = bySuit[flushSuit];
+    const fv = idx.map((i) => vals[i]);
+    const sh2 = straightHigh(fv);
+    if (sh2) {
+      const want = [0, 1, 2, 3, 4].map((k2) => sh2 - k2);
+      const cat = sh2 === 14 ? 9 : 8;
+      return { score: pack(cat, [sh2]), cat, name: HAND_NAMES[cat], best: pickByValue(want, idx) };
+    }
+  }
+  const groups = [];
+  for (let v = 14; v >= 2; v--) if (count[v]) groups.push([count[v], v]);
+  groups.sort((a, b) => b[0] - a[0] || b[1] - a[1]);
+  const kickers = (exclude, k2) => {
+    const out = [];
+    for (let v = 14; v >= 2 && out.length < k2; v--) if (count[v] && !exclude.includes(v)) out.push(v);
+    return out;
+  };
+  if (groups[0][0] === 4) {
+    const q = groups[0][1];
+    const k2 = kickers([q], 1);
+    return { score: pack(7, [q, ...k2]), cat: 7, name: HAND_NAMES[7], best: pickByValue([q, q, q, q, ...k2]) };
+  }
+  if (groups[0][0] === 3 && groups.some((g, i) => i > 0 && g[0] >= 2)) {
+    const t = groups[0][1];
+    const p = groups.filter((g, i) => i > 0 && g[0] >= 2).sort((a, b) => b[1] - a[1])[0][1];
+    return { score: pack(6, [t, p]), cat: 6, name: HAND_NAMES[6], best: pickByValue([t, t, t, p, p]) };
+  }
+  if (flushSuit) {
+    const idx = [...bySuit[flushSuit]].sort((a, b) => vals[b] - vals[a]).slice(0, 5);
+    const ks = idx.map((i) => vals[i]);
+    return { score: pack(5, ks), cat: 5, name: HAND_NAMES[5], best: idx.map((i) => cards[i].id) };
+  }
+  const sh = straightHigh(vals);
+  if (sh) {
+    const want = [0, 1, 2, 3, 4].map((k2) => sh - k2 === 1 ? 1 : sh - k2);
+    return { score: pack(4, [sh]), cat: 4, name: HAND_NAMES[4], best: pickByValue(want) };
+  }
+  if (groups[0][0] === 3) {
+    const t = groups[0][1];
+    const k2 = kickers([t], 2);
+    return { score: pack(3, [t, ...k2]), cat: 3, name: HAND_NAMES[3], best: pickByValue([t, t, t, ...k2]) };
+  }
+  if (groups[0][0] === 2 && groups[1]?.[0] === 2) {
+    const [p1, p2] = [groups[0][1], groups[1][1]];
+    const k2 = kickers([p1, p2], 1);
+    return { score: pack(2, [p1, p2, ...k2]), cat: 2, name: HAND_NAMES[2], best: pickByValue([p1, p1, p2, p2, ...k2]) };
+  }
+  if (groups[0][0] === 2) {
+    const p = groups[0][1];
+    const k2 = kickers([p], 3);
+    return { score: pack(1, [p, ...k2]), cat: 1, name: HAND_NAMES[1], best: pickByValue([p, p, ...k2]) };
+  }
+  const k = kickers([], Math.min(5, n));
+  return { score: pack(0, k), cat: 0, name: HAND_NAMES[0], best: pickByValue(k) };
+}
+function describeHand(ev) {
+  const top = Math.floor(ev.score / 15 ** 4) % 15;
+  const sec = Math.floor(ev.score / 15 ** 3) % 15;
+  const nm = (v) => ({ 14: "Asse", 13: "K\xF6nige", 12: "Damen", 11: "Buben", 10: "Zehner" })[v] ?? `${v}er`;
+  const hi = (v) => ({ 14: "zum Ass", 13: "zum K\xF6nig", 12: "zur Dame", 11: "zum Buben" })[v] ?? `zur ${v}`;
+  switch (ev.cat) {
+    case 1:
+      return `Paar ${nm(top)}`;
+    case 2:
+      return `Zwei Paare, ${nm(top)} und ${nm(sec)}`;
+    case 3:
+      return `Drilling ${nm(top)}`;
+    case 4:
+      return `Stra\xDFe bis ${hi(top)}`;
+    case 6:
+      return `Full House, ${nm(top)} \xFCber ${nm(sec)}`;
+    case 7:
+      return `Vierling ${nm(top)}`;
+    case 8:
+      return `Straight Flush bis ${hi(top)}`;
+    default:
+      return ev.name;
+  }
+}
+
+// ../shared/poker/PokerGame.js
+var PokerError = class extends Error {
+  constructor(code, message) {
+    super(message);
+    this.code = code;
+  }
+};
+var POKER_DEFAULTS = { startChips: 1e3, sb: 5, bb: 10, mode: "cash", blindEvery: 10, turnMs: 3e4 };
+var POKER_MAX_PLAYERS = 9;
+var STREETS = ["preflop", "flop", "turn", "river"];
+var PokerGame = class {
+  /**
+   * @param {{id:string,name?:string}[]} players – Sitzreihenfolge im Uhrzeigersinn
+   * @param {{startChips?:number,sb?:number,bb?:number,mode?:'cash'|'tournament',blindEvery?:number,turnMs?:number,rand?:Function}} opts
+   */
+  constructor(players, opts = {}) {
+    if (players.length < 2) throw new PokerError("PLAYER_COUNT", "Poker braucht mindestens 2 Spieler.");
+    if (players.length > POKER_MAX_PLAYERS) throw new PokerError("PLAYER_COUNT", `H\xF6chstens ${POKER_MAX_PLAYERS} Spieler.`);
+    this.kind = "poker";
+    this.opts = { ...POKER_DEFAULTS, ...opts };
+    this.rand = opts.rand;
+    this.order = players.map((p) => p.id);
+    this.stacks = Object.fromEntries(players.map((p) => [p.id, this.opts.startChips]));
+    this.buyins = Object.fromEntries(players.map((p) => [p.id, 1]));
+    this.sb = this.opts.sb;
+    this.bb = this.opts.bb;
+    this.level = 1;
+    this.handNo = 0;
+    this.button = -1;
+    this.eliminated = [];
+    this.seq = 0;
+    this.history = [];
+    this.startHand();
+  }
+  get mode() {
+    return this.opts.mode;
+  }
+  /** Spieler, die in dieser Hand Karten haben (nicht pleite/ausgeschieden). */
+  #seated() {
+    return this.order.filter((id) => this.stacks[id] > 0 && !this.eliminated.includes(id));
+  }
+  #nextSeat(fromIdx, pred) {
+    const n = this.order.length;
+    for (let k = 1; k <= n; k++) {
+      const i = (fromIdx + k) % n;
+      if (pred(this.order[i])) return i;
+    }
+    return -1;
+  }
+  startHand() {
+    for (const id of this.order) {
+      if (this.stacks[id] > 0 || this.eliminated.includes(id)) continue;
+      if (this.mode === "cash") {
+        this.stacks[id] = this.opts.startChips;
+        this.buyins[id] += 1;
+      } else this.eliminated.push(id);
+    }
+    const seated = this.#seated();
+    if (seated.length < 2) {
+      this.phase = "over";
+      this.winnerId = seated[0] ?? null;
+      this.currentPlayerId = null;
+      this.seq++;
+      return { type: "poker_over", winnerId: this.winnerId };
+    }
+    if (this.mode === "tournament" && this.handNo > 0 && this.handNo % this.opts.blindEvery === 0) {
+      this.level += 1;
+      this.sb = Math.round(this.opts.sb * 1.5 ** (this.level - 1));
+      this.bb = this.sb * 2;
+    }
+    this.handNo += 1;
+    const live = (id) => this.stacks[id] > 0 && !this.eliminated.includes(id);
+    this.button = this.#nextSeat(this.button < 0 ? this.order.length - 1 : this.button, live);
+    this.deck = shuffle2(newDeck(), this.rand);
+    this.board = [];
+    this.holes = {};
+    this.inHand = new Set(seated);
+    this.folded = /* @__PURE__ */ new Set();
+    this.allIn = /* @__PURE__ */ new Set();
+    this.bets = Object.fromEntries(seated.map((id) => [id, 0]));
+    this.committed = Object.fromEntries(seated.map((id) => [id, 0]));
+    this.shown = {};
+    this.result = null;
+    this.lastAction = {};
+    for (let r = 0; r < 2; r++) for (const id of this.#fromButton(1)) (this.holes[id] ??= []).push(this.deck.pop());
+    const headsUp = seated.length === 2;
+    const sbIdx = headsUp ? this.button : this.#nextSeat(this.button, live);
+    const bbIdx = this.#nextSeat(sbIdx, live);
+    this.sbId = this.order[sbIdx];
+    this.bbId = this.order[bbIdx];
+    this.#post(this.sbId, this.sb);
+    this.#post(this.bbId, this.bb);
+    this.lastAction[this.sbId] = { type: "sb", amount: this.bets[this.sbId] };
+    this.lastAction[this.bbId] = { type: "bb", amount: this.bets[this.bbId] };
+    this.street = "preflop";
+    this.phase = "betting";
+    this.currentBet = this.bb;
+    this.minRaise = this.bb;
+    this.locked = /* @__PURE__ */ new Set();
+    this.acted = /* @__PURE__ */ new Set();
+    this.needToAct = new Set([...this.inHand].filter((id) => !this.allIn.has(id)));
+    const first = this.order[this.#nextSeat(bbIdx, (id) => this.needToAct.has(id))] ?? null;
+    this.currentPlayerId = first;
+    this.turnStarted = Date.now();
+    this.seq++;
+    const ev = { type: "poker_hand", handNo: this.handNo, button: this.order[this.button], sbId: this.sbId, bbId: this.bbId, sb: this.sb, bb: this.bb };
+    if (this.needToAct.size === 0 || this.needToAct.size === 1 && this.bets[first] >= this.currentBet) return { ...ev, after: this.#endRound() };
+    return ev;
+  }
+  /** Spieler in Reihenfolge ab Button+offset (nur die mit Karten). */
+  #fromButton(offset = 1) {
+    const out = [];
+    const n = this.order.length;
+    for (let k = 0; k < n; k++) {
+      const id = this.order[(this.button + offset + k) % n];
+      if (this.inHand.has(id)) out.push(id);
+    }
+    return out;
+  }
+  #post(id, amount) {
+    const a = Math.min(amount, this.stacks[id]);
+    this.stacks[id] -= a;
+    this.bets[id] += a;
+    this.committed[id] += a;
+    if (this.stacks[id] === 0) this.allIn.add(id);
+    return a;
+  }
+  /** Erlaubte Aktionen für den Spieler am Zug. */
+  options(id = this.currentPlayerId) {
+    if (this.phase !== "betting" || id !== this.currentPlayerId) return null;
+    const toCall = this.currentBet - this.bets[id];
+    const stack = this.stacks[id];
+    const maxTo = this.bets[id] + stack;
+    const canRaise = !this.locked.has(id) && maxTo > this.currentBet && [...this.inHand].some((o) => o !== id && !this.folded.has(o) && !this.allIn.has(o));
+    const minTo = Math.min(maxTo, this.currentBet + this.minRaise);
+    return {
+      toCall: Math.min(toCall, stack),
+      canCheck: toCall <= 0,
+      canCall: toCall > 0,
+      canRaise,
+      isBet: this.currentBet === 0,
+      minTo: canRaise ? this.currentBet === 0 ? Math.min(maxTo, this.bb) : minTo : null,
+      maxTo,
+      pot: this.potTotal()
+    };
+  }
+  potTotal() {
+    return Object.values(this.committed).reduce((a, b) => a + b, 0);
+  }
+  /**
+   * Aktion: { type: 'fold' | 'check' | 'call' | 'raise' | 'allin', to?: Gesamteinsatz dieser Runde }
+   * 'raise' gilt auch für Bet. 'allin' = alles setzen (als Call oder Raise).
+   */
+  act(id, action) {
+    if (this.phase !== "betting") throw new PokerError("NOT_BETTING", "Gerade wird nicht gesetzt.");
+    if (id !== this.currentPlayerId) throw new PokerError("NOT_YOUR_TURN", "Du bist nicht dran.");
+    const o = this.options(id);
+    const type = action?.type;
+    let event = { type: "poker_action", playerId: id, action: type };
+    if (type === "fold") {
+      this.folded.add(id);
+      this.needToAct.delete(id);
+    } else if (type === "check") {
+      if (!o.canCheck) throw new PokerError("CANT_CHECK", "Schieben geht nicht \u2013 es liegt ein Einsatz.");
+      this.needToAct.delete(id);
+    } else if (type === "call") {
+      if (!o.canCall) throw new PokerError("NOTHING_TO_CALL", "Es gibt nichts mitzugehen.");
+      event.amount = this.#post(id, o.toCall);
+      this.needToAct.delete(id);
+    } else if (type === "raise" || type === "allin") {
+      let to = type === "allin" ? o.maxTo : Math.floor(Number(action.to));
+      if (type === "allin" && !o.canRaise) {
+        if (!o.canCall && !o.canCheck) throw new PokerError("BAD_ACTION", "Ung\xFCltig.");
+        if (o.canCall) {
+          event = { ...event, action: "call", amount: this.#post(id, o.toCall) };
+          this.needToAct.delete(id);
+          return this.#afterAction(id, event);
+        }
+        throw new PokerError("CANT_RAISE", "Erh\xF6hen ist hier nicht erlaubt.");
+      }
+      if (!o.canRaise) throw new PokerError("CANT_RAISE", "Erh\xF6hen ist hier nicht erlaubt.");
+      if (!Number.isFinite(to)) throw new PokerError("BAD_AMOUNT", "Ung\xFCltiger Betrag.");
+      to = Math.min(to, o.maxTo);
+      if (to <= this.currentBet) {
+        event = { ...event, action: "call", amount: this.#post(id, Math.max(0, this.currentBet - this.bets[id])) };
+        this.needToAct.delete(id);
+        return this.#afterAction(id, event);
+      }
+      if (to < o.minTo && to < o.maxTo) throw new PokerError("RAISE_TOO_SMALL", `Mindestens auf ${o.minTo} erh\xF6hen.`);
+      const raiseBy = to - this.currentBet;
+      this.#post(id, to - this.bets[id]);
+      const full = raiseBy >= this.minRaise || this.currentBet === 0 && to >= this.bb;
+      event = { ...event, action: this.currentBet === 0 ? "bet" : "raise", to };
+      if (full) {
+        this.minRaise = Math.max(this.minRaise, raiseBy);
+        this.locked.clear();
+        this.acted.clear();
+      } else {
+        for (const a of this.acted) this.locked.add(a);
+      }
+      this.currentBet = to;
+      this.needToAct = new Set([...this.inHand].filter((p) => p !== id && !this.folded.has(p) && !this.allIn.has(p)));
+    } else throw new PokerError("BAD_ACTION", "Unbekannte Aktion.");
+    return this.#afterAction(id, event);
+  }
+  #afterAction(id, event) {
+    if (this.stacks[id] === 0 && !this.folded.has(id)) {
+      this.allIn.add(id);
+      event.allIn = true;
+    }
+    this.acted.add(id);
+    this.lastAction[id] = { type: event.action, amount: event.to ?? event.amount };
+    this.seq++;
+    const alive = [...this.inHand].filter((p) => !this.folded.has(p));
+    if (alive.length === 1) return { ...event, after: this.#award(true) };
+    if (this.needToAct.size === 0) return { ...event, after: this.#endRound() };
+    const idx = this.order.indexOf(id);
+    this.currentPlayerId = this.order[this.#nextSeat(idx, (p) => this.needToAct.has(p))];
+    this.turnStarted = Date.now();
+    return event;
+  }
+  #endRound() {
+    for (const id of Object.keys(this.bets)) this.bets[id] = 0;
+    this.currentBet = 0;
+    this.minRaise = this.bb;
+    this.locked = /* @__PURE__ */ new Set();
+    this.acted = /* @__PURE__ */ new Set();
+    const canAct = [...this.inHand].filter((p) => !this.folded.has(p) && !this.allIn.has(p));
+    const streetIdx = STREETS.indexOf(this.street);
+    if (streetIdx === 3) return this.#award(false);
+    this.street = STREETS[streetIdx + 1];
+    this.deck.pop();
+    if (this.street === "flop") this.board.push(this.deck.pop(), this.deck.pop(), this.deck.pop());
+    else this.board.push(this.deck.pop());
+    this.seq++;
+    if (canAct.length <= 1) {
+      this.allInRunout = true;
+      return { type: "poker_street", street: this.street, board: this.board.map((c) => c.id), runout: true, next: this.#endRound() };
+    }
+    this.needToAct = new Set(canAct);
+    const first = this.order[this.#nextSeat(this.button, (p) => this.needToAct.has(p))];
+    this.currentPlayerId = first;
+    this.turnStarted = Date.now();
+    return { type: "poker_street", street: this.street, board: this.board.map((c) => c.id) };
+  }
+  /** Töpfe bilden und verteilen. */
+  #award(uncontested) {
+    this.phase = "showdown";
+    this.currentPlayerId = null;
+    const alive = [...this.inHand].filter((p) => !this.folded.has(p));
+    const hands = {};
+    if (!uncontested) {
+      for (const id of alive) {
+        const ev = evaluate([...this.holes[id], ...this.board]);
+        hands[id] = { score: ev.score, name: describeHand(ev), best: ev.best };
+        this.shown[id] = true;
+      }
+    }
+    const levels = [...new Set(Object.values(this.committed).filter((v) => v > 0))].sort((a, b) => a - b);
+    const pots = [];
+    let prev = 0;
+    for (const lv of levels) {
+      let amount = 0;
+      for (const id of Object.keys(this.committed)) amount += Math.max(0, Math.min(this.committed[id], lv) - prev);
+      const eligible = alive.filter((id) => this.committed[id] >= lv);
+      if (amount > 0) {
+        const last = pots[pots.length - 1];
+        if (last && last.eligible.join() === eligible.join()) last.amount += amount;
+        else pots.push({ amount, eligible });
+      }
+      prev = lv;
+    }
+    const won = Object.fromEntries(Object.keys(this.committed).map((id) => [id, 0]));
+    const potResults = [];
+    for (const pot of pots) {
+      let winners;
+      if (pot.eligible.length === 0) {
+        const top = Object.keys(this.committed).sort((a, b) => this.committed[b] - this.committed[a])[0];
+        winners = [top];
+      } else if (pot.eligible.length === 1) winners = pot.eligible;
+      else {
+        const best = Math.max(...pot.eligible.map((id) => hands[id].score));
+        winners = pot.eligible.filter((id) => hands[id].score === best);
+      }
+      const share = Math.floor(pot.amount / winners.length);
+      let odd = pot.amount - share * winners.length;
+      const ordered = this.#fromButton(1).filter((id) => winners.includes(id));
+      for (const id of ordered) {
+        won[id] += share + (odd > 0 ? 1 : 0);
+        odd = Math.max(0, odd - 1);
+      }
+      potResults.push({ amount: pot.amount, winners, returned: pot.eligible.length === 1 && pots.length > 1 && pot === pots[pots.length - 1] && !uncontested });
+    }
+    for (const id of Object.keys(won)) this.stacks[id] += won[id];
+    const net = Object.fromEntries(Object.keys(won).map((id) => [id, won[id] - this.committed[id]]));
+    this.result = { uncontested, pots: potResults, won, net, hands };
+    this.history.unshift({
+      handNo: this.handNo,
+      board: this.board.map((c) => c.id),
+      winners: [...new Set(potResults.flatMap((p) => p.winners))],
+      pot: this.potTotal(),
+      hand: uncontested ? null : hands[potResults[0]?.winners[0]]?.name
+    });
+    this.history = this.history.slice(0, 20);
+    this.showdownAt = Date.now();
+    this.seq++;
+    return { type: "poker_showdown", uncontested, pots: potResults, won, hands, board: this.board.map((c) => c.id) };
+  }
+  /** Nach dem Showdown: Karten freiwillig zeigen. */
+  show(id) {
+    if (this.phase !== "showdown" || !this.holes[id]) throw new PokerError("NOT_NOW", "Jetzt nicht.");
+    this.shown[id] = true;
+    this.seq++;
+    return { type: "poker_show", playerId: id };
+  }
+  nextHand() {
+    if (this.phase !== "showdown") throw new PokerError("NOT_NOW", "Die Hand l\xE4uft noch.");
+    return this.startHand();
+  }
+  /** Zeit abgelaufen: schieben wenn möglich, sonst aussteigen. */
+  timeout(id = this.currentPlayerId) {
+    const o = this.options(id);
+    if (!o) return null;
+    return this.act(id, { type: o.canCheck ? "check" : "fold" });
+  }
+  /** Spieler verlässt den Tisch: Karten weg, Chips bleiben verloren. */
+  removePlayer(id) {
+    if (!this.order.includes(id)) return null;
+    let ev = null;
+    if (this.phase === "betting" && this.inHand.has(id) && !this.folded.has(id)) {
+      if (this.currentPlayerId === id) ev = this.act(id, { type: "fold" });
+      else {
+        this.folded.add(id);
+        this.needToAct.delete(id);
+        const alive = [...this.inHand].filter((p) => !this.folded.has(p));
+        if (alive.length === 1) ev = this.#award(true);
+      }
+    }
+    this.stacks[id] = 0;
+    if (!this.eliminated.includes(id)) this.eliminated.push(id);
+    this.seq++;
+    return ev;
+  }
+  replacePlayer(oldId, newId2) {
+    const i = this.order.indexOf(oldId);
+    if (i < 0) return;
+    this.order[i] = newId2;
+    const move = (obj) => {
+      if (obj && oldId in obj) {
+        obj[newId2] = obj[oldId];
+        delete obj[oldId];
+      }
+    };
+    [this.stacks, this.buyins, this.holes, this.bets, this.committed, this.shown, this.lastAction].forEach(move);
+    for (const set of [this.inHand, this.folded, this.allIn, this.needToAct, this.locked, this.acted]) if (set?.delete(oldId)) set.add(newId2);
+    if (this.currentPlayerId === oldId) this.currentPlayerId = newId2;
+    if (this.sbId === oldId) this.sbId = newId2;
+    if (this.bbId === oldId) this.bbId = newId2;
+    this.seq++;
+  }
+  getStateFor(viewer) {
+    const showAll = this.phase === "showdown";
+    return {
+      kind: "poker",
+      phase: this.phase,
+      street: this.street,
+      handNo: this.handNo,
+      mode: this.mode,
+      level: this.level,
+      sb: this.sb,
+      bb: this.bb,
+      order: this.order,
+      button: this.order[this.button],
+      sbId: this.sbId,
+      bbId: this.bbId,
+      currentPlayerId: this.currentPlayerId,
+      board: this.board.map((c) => c.id),
+      stacks: this.stacks,
+      bets: this.bets,
+      committed: this.committed,
+      buyins: this.buyins,
+      startChips: this.opts.startChips,
+      inHand: [...this.inHand],
+      folded: [...this.folded],
+      allIn: [...this.allIn],
+      eliminated: this.eliminated,
+      lastAction: this.lastAction,
+      pot: this.potTotal(),
+      currentBet: this.currentBet,
+      holes: Object.fromEntries(
+        Object.entries(this.holes).map(([id, cs]) => [id, id === viewer || showAll && this.shown[id] ? cs.map((c) => c.id) : cs.map(() => null)])
+      ),
+      options: viewer === this.currentPlayerId ? this.options(viewer) : null,
+      myHand: this.holes[viewer] && this.board.length ? describeHand(evaluate([...this.holes[viewer], ...this.board])) : null,
+      result: this.result,
+      history: this.history.slice(0, 10),
+      winnerId: this.winnerId ?? null,
+      turnMs: this.opts.turnMs,
+      turnLeft: this.phase === "betting" && this.opts.turnMs ? Math.max(0, this.opts.turnMs - (Date.now() - this.turnStarted)) : null,
+      seq: this.seq
+    };
+  }
+};
+
+// ../shared/blackjack/BlackjackGame.js
+var BlackjackError = class extends Error {
+  constructor(code, message) {
+    super(message);
+    this.code = code;
+  }
+};
+var BJ_DEFAULTS = { decks: 6, h17: false, bjPays: "3:2", surrender: true, das: true, maxHands: 4, startChips: 1e3, minBet: 5, maxBet: 1e3, turnMs: 3e4, betMs: 2e4 };
+var BJ_MAX_SEATS = 7;
+var cardValue = (c) => c.rank === "A" ? 11 : "TJQK".includes(c.rank) ? 10 : Number(c.rank);
+var tenValue = (c) => cardValue(c) === 10;
+function handValue(cards) {
+  let total = 0;
+  let aces = 0;
+  for (const c of cards) {
+    total += cardValue(c);
+    if (c.rank === "A") aces++;
+  }
+  while (total > 21 && aces > 0) {
+    total -= 10;
+    aces--;
+  }
+  return { total, soft: aces > 0, bust: total > 21 };
+}
+var BlackjackGame = class {
+  constructor(players, opts = {}) {
+    if (!players.length) throw new BlackjackError("PLAYER_COUNT", "Mindestens ein Spieler.");
+    if (players.length > BJ_MAX_SEATS) throw new BlackjackError("PLAYER_COUNT", `H\xF6chstens ${BJ_MAX_SEATS} Pl\xE4tze.`);
+    this.kind = "blackjack";
+    this.opts = { ...BJ_DEFAULTS, ...opts };
+    this.rand = opts.rand;
+    this.order = players.map((p) => p.id);
+    this.chips = Object.fromEntries(players.map((p) => [p.id, this.opts.startChips]));
+    this.refills = Object.fromEntries(players.map((p) => [p.id, 0]));
+    this.lastBet = {};
+    this.round = 0;
+    this.seq = 0;
+    this.#newShoe();
+    this.startBetting();
+  }
+  #newShoe() {
+    this.shoe = shuffle2(newDeck(this.opts.decks), this.rand);
+    this.cut = Math.floor(this.shoe.length * 0.25);
+    this.shuffled = true;
+  }
+  #draw() {
+    if (!this.shoe.length) this.#newShoe();
+    return this.shoe.pop();
+  }
+  startBetting() {
+    if (this.shoe.length <= this.cut) this.#newShoe();
+    for (const id of this.order) {
+      if (this.chips[id] < this.opts.minBet) {
+        this.chips[id] = this.opts.startChips;
+        this.refills[id] += 1;
+      }
+    }
+    this.round += 1;
+    this.phase = "betting";
+    this.bets = {};
+    this.ready = /* @__PURE__ */ new Set();
+    this.hands = {};
+    this.insurance = {};
+    this.dealer = [];
+    this.holeHidden = true;
+    this.active = null;
+    this.results = null;
+    this.betStarted = Date.now();
+    this.seq++;
+    return { type: "bj_betting", round: this.round };
+  }
+  get currentPlayerId() {
+    return this.phase === "playing" ? this.active?.id ?? null : null;
+  }
+  /** Einsatz setzen (0 = diese Runde aussetzen). Sind alle fertig, wird ausgeteilt. */
+  bet(id, amount) {
+    if (this.phase !== "betting") throw new BlackjackError("NOT_BETTING", "Gerade wird nicht gesetzt.");
+    if (!this.order.includes(id)) throw new BlackjackError("NOT_PLAYER", "Du sitzt nicht am Tisch.");
+    const a = Math.floor(Number(amount) || 0);
+    if (a !== 0 && (a < this.opts.minBet || a > Math.min(this.opts.maxBet, this.chips[id])))
+      throw new BlackjackError("BAD_BET", `Einsatz zwischen ${this.opts.minBet} und ${Math.min(this.opts.maxBet, this.chips[id])}.`);
+    if (a) {
+      this.bets[id] = a;
+      this.lastBet[id] = a;
+    } else delete this.bets[id];
+    this.ready.add(id);
+    this.seq++;
+    if (this.order.every((p) => this.ready.has(p))) return this.deal();
+    return { type: "bj_bet", playerId: id, amount: a };
+  }
+  /** Austeilen (alle gesetzt oder Zeit für Einsätze abgelaufen). */
+  deal() {
+    if (this.phase !== "betting") throw new BlackjackError("NOT_BETTING", "Schon ausgeteilt.");
+    const players = this.order.filter((id) => this.bets[id] > 0);
+    if (!players.length) {
+      this.ready = /* @__PURE__ */ new Set();
+      this.betStarted = Date.now();
+      this.seq++;
+      return { type: "bj_nobody" };
+    }
+    for (const id of players) {
+      this.chips[id] -= this.bets[id];
+      this.hands[id] = [{ cards: [], bet: this.bets[id], doubled: false, split: false, done: false }];
+    }
+    this.shuffled = false;
+    for (let r = 0; r < 2; r++) {
+      for (const id of players) this.hands[id][0].cards.push(this.#draw());
+      this.dealer.push(this.#draw());
+    }
+    this.seq++;
+    const up2 = this.dealer[0];
+    if (up2.rank === "A") {
+      this.phase = "insurance";
+      this.insurance = {};
+      this.insStarted = Date.now();
+      return { type: "bj_deal", insurance: true };
+    }
+    return { type: "bj_deal", ...this.#afterPeek() };
+  }
+  /** Versicherung: ja/nein (kostet den halben Einsatz, zahlt 2:1). */
+  insure(id, yes) {
+    if (this.phase !== "insurance") throw new BlackjackError("NOT_NOW", "Keine Versicherung jetzt.");
+    if (!this.hands[id]) throw new BlackjackError("NOT_PLAYER", "Du spielst diese Runde nicht.");
+    if (id in this.insurance) return null;
+    const cost = Math.floor(this.hands[id][0].bet / 2);
+    if (yes && cost > this.chips[id]) throw new BlackjackError("NO_CHIPS", "Nicht genug Chips f\xFCr die Versicherung.");
+    this.insurance[id] = yes ? cost : 0;
+    if (yes) this.chips[id] -= cost;
+    this.seq++;
+    if (Object.keys(this.hands).every((p) => p in this.insurance)) return { type: "bj_insured", ...this.#afterPeek() };
+    return { type: "bj_insure", playerId: id, yes };
+  }
+  /** Dealer schaut bei Ass/Zehn nach Blackjack. */
+  #afterPeek() {
+    const dv = handValue(this.dealer);
+    const dealerBJ = dv.total === 21 && this.dealer.length === 2;
+    if ((this.dealer[0].rank === "A" || tenValue(this.dealer[0])) && dealerBJ) {
+      this.holeHidden = false;
+      return { dealerBlackjack: true, settle: this.#settle() };
+    }
+    this.phase = "playing";
+    for (const id of Object.keys(this.hands)) {
+      const h = this.hands[id][0];
+      if (handValue(h.cards).total === 21) {
+        h.done = true;
+        h.blackjack = true;
+      }
+    }
+    return { peeked: this.dealer[0].rank === "A" || tenValue(this.dealer[0]), next: this.#advance() };
+  }
+  /** Nächste offene Hand suchen – sonst spielt der Dealer. */
+  #advance() {
+    for (const id of this.order) {
+      const hs = this.hands[id];
+      if (!hs) continue;
+      for (let i = 0; i < hs.length; i++) {
+        const h = hs[i];
+        if (h.done) continue;
+        if (h.cards.length === 1) {
+          h.cards.push(this.#draw());
+          if (h.splitAces || handValue(h.cards).total === 21) {
+            h.done = true;
+            continue;
+          }
+        }
+        this.active = { id, hand: i };
+        this.turnStarted = Date.now();
+        this.seq++;
+        return { type: "bj_turn", playerId: id, hand: i };
+      }
+    }
+    this.active = null;
+    return this.#dealerPlay();
+  }
+  #dealerPlay() {
+    this.phase = "dealer";
+    this.holeHidden = false;
+    const live = Object.values(this.hands).some((hs) => hs.some((h) => !h.surrendered && !handValue(h.cards).bust && !h.blackjack));
+    if (live) {
+      for (; ; ) {
+        const v = handValue(this.dealer);
+        if (v.total > 17 || v.total === 17 && !(v.soft && this.opts.h17)) break;
+        this.dealer.push(this.#draw());
+      }
+    }
+    return this.#settle();
+  }
+  #settle() {
+    this.phase = "settled";
+    this.holeHidden = false;
+    this.active = null;
+    const dv = handValue(this.dealer);
+    const dealerBJ = dv.total === 21 && this.dealer.length === 2;
+    const [num, den] = this.opts.bjPays.split(":").map(Number);
+    const results = {};
+    for (const [id, hs] of Object.entries(this.hands)) {
+      let net = 0;
+      const ins = this.insurance[id] ?? 0;
+      if (ins) {
+        if (dealerBJ) {
+          this.chips[id] += ins * 3;
+          net += ins * 2;
+        } else net -= ins;
+      }
+      for (const h of hs) {
+        const v = handValue(h.cards);
+        let pay = 0;
+        let res;
+        if (h.surrendered) {
+          pay = Math.floor(h.bet / 2);
+          res = "surrender";
+        } else if (v.bust) res = "bust";
+        else if (h.blackjack && !h.split) {
+          if (dealerBJ) {
+            pay = h.bet;
+            res = "push";
+          } else {
+            pay = h.bet + Math.floor(h.bet * num / den);
+            res = "blackjack";
+          }
+        } else if (dealerBJ) res = "lose";
+        else if (dv.bust || v.total > dv.total) {
+          pay = h.bet * 2;
+          res = "win";
+        } else if (v.total === dv.total) {
+          pay = h.bet;
+          res = "push";
+        } else res = "lose";
+        h.result = res;
+        h.payout = pay - h.bet;
+        this.chips[id] += pay;
+        net += pay - h.bet;
+      }
+      results[id] = net;
+    }
+    this.results = { dealer: dv.total, dealerBust: dv.bust, dealerBlackjack: dealerBJ, net: results };
+    this.settledAt = Date.now();
+    this.seq++;
+    return { type: "bj_settle", ...this.results };
+  }
+  /** Erlaubte Aktionen der aktiven Hand. */
+  options(id = this.currentPlayerId) {
+    if (this.phase !== "playing" || !this.active || this.active.id !== id) return null;
+    const hs = this.hands[id];
+    const h = hs[this.active.hand];
+    const two = h.cards.length === 2;
+    const canAfford = this.chips[id] >= h.bet;
+    const pair = two && (h.cards[0].rank === h.cards[1].rank || tenValue(h.cards[0]) && tenValue(h.cards[1]));
+    return {
+      hit: true,
+      stand: true,
+      double: two && canAfford && (!h.split || this.opts.das),
+      split: pair && canAfford && hs.length < this.opts.maxHands && !(h.splitAces && h.cards[0].rank === "A"),
+      surrender: two && hs.length === 1 && !h.split && this.opts.surrender
+    };
+  }
+  act(id, type) {
+    const o = this.options(id);
+    if (!o) throw new BlackjackError("NOT_YOUR_TURN", "Du bist nicht dran.");
+    if (!o[type]) throw new BlackjackError("NOT_ALLOWED", "Das geht hier nicht.");
+    const hs = this.hands[id];
+    const h = hs[this.active.hand];
+    let ev = { type: "bj_action", playerId: id, action: type, hand: this.active.hand };
+    if (type === "hit") {
+      h.cards.push(this.#draw());
+      const v = handValue(h.cards);
+      if (v.total >= 21) h.done = true;
+      ev.total = v.total;
+    } else if (type === "stand") h.done = true;
+    else if (type === "double") {
+      this.chips[id] -= h.bet;
+      h.bet *= 2;
+      h.doubled = true;
+      h.cards.push(this.#draw());
+      h.done = true;
+    } else if (type === "split") {
+      this.chips[id] -= h.bet;
+      const aces = h.cards[0].rank === "A";
+      const second = { cards: [h.cards.pop()], bet: h.bet, doubled: false, split: true, splitAces: aces, done: false };
+      h.split = true;
+      h.splitAces = aces;
+      hs.splice(this.active.hand + 1, 0, second);
+      h.cards.push(this.#draw());
+      if (aces || handValue(h.cards).total === 21) h.done = true;
+    } else if (type === "surrender") {
+      h.surrendered = true;
+      h.done = true;
+    }
+    this.seq++;
+    if (h.done) return { ...ev, next: this.#advance() };
+    this.turnStarted = Date.now();
+    return ev;
+  }
+  /** Zeit abgelaufen: stehen bleiben / nicht versichern / aussetzen. */
+  timeout() {
+    if (this.phase === "playing" && this.active) return this.act(this.active.id, "stand");
+    if (this.phase === "insurance") {
+      let ev = null;
+      for (const id of Object.keys(this.hands)) if (!(id in this.insurance)) ev = this.insure(id, false) ?? ev;
+      return ev;
+    }
+    if (this.phase === "betting") return this.deal();
+    return null;
+  }
+  nextRound() {
+    if (this.phase !== "settled") throw new BlackjackError("NOT_NOW", "Die Runde l\xE4uft noch.");
+    return this.startBetting();
+  }
+  /** Wer fehlt noch (für Bots/Anzeige)? */
+  waitingOn() {
+    if (this.phase === "betting") return this.order.filter((id) => !this.ready.has(id));
+    if (this.phase === "insurance") return Object.keys(this.hands).filter((id) => !(id in this.insurance));
+    if (this.phase === "playing" && this.active) return [this.active.id];
+    return [];
+  }
+  addPlayer(id) {
+    if (this.order.length >= BJ_MAX_SEATS || this.order.includes(id)) return;
+    this.order.push(id);
+    this.chips[id] = this.opts.startChips;
+    this.refills[id] = 0;
+    if (this.phase === "betting") this.seq++;
+  }
+  removePlayer(id) {
+    if (!this.order.includes(id)) return null;
+    let ev = null;
+    if (this.active?.id === id) {
+      for (const h of this.hands[id]) h.done = true;
+      ev = this.#advance();
+    } else if (this.phase === "insurance" && this.hands[id] && !(id in this.insurance)) ev = this.insure(id, false);
+    this.order = this.order.filter((p) => p !== id);
+    this.ready?.delete(id);
+    delete this.bets[id];
+    if (this.phase === "betting" && this.order.length && this.order.every((p) => this.ready.has(p))) ev = this.deal();
+    this.seq++;
+    return ev;
+  }
+  replacePlayer(oldId, newId2) {
+    const i = this.order.indexOf(oldId);
+    if (i < 0) return;
+    this.order[i] = newId2;
+    for (const obj of [this.chips, this.refills, this.lastBet, this.bets, this.hands, this.insurance]) {
+      if (obj && oldId in obj) {
+        obj[newId2] = obj[oldId];
+        delete obj[oldId];
+      }
+    }
+    if (this.ready?.delete(oldId)) this.ready.add(newId2);
+    if (this.active?.id === oldId) this.active.id = newId2;
+    if (this.results?.net && oldId in this.results.net) {
+      this.results.net[newId2] = this.results.net[oldId];
+      delete this.results.net[oldId];
+    }
+    this.seq++;
+  }
+  getStateFor(viewer) {
+    const show = (h) => ({
+      cards: h.cards.map((c) => c.id),
+      bet: h.bet,
+      doubled: h.doubled,
+      split: h.split,
+      done: h.done,
+      blackjack: Boolean(h.blackjack && !h.split),
+      surrendered: Boolean(h.surrendered),
+      result: h.result ?? null,
+      payout: h.payout ?? null,
+      value: handValue(h.cards)
+    });
+    const dealerShown = this.holeHidden ? this.dealer.slice(0, 1) : this.dealer;
+    return {
+      kind: "blackjack",
+      phase: this.phase,
+      round: this.round,
+      order: this.order,
+      chips: this.chips,
+      refills: this.refills,
+      bets: this.bets,
+      lastBet: this.lastBet,
+      ready: [...this.ready ?? []],
+      hands: Object.fromEntries(Object.entries(this.hands).map(([id, hs]) => [id, hs.map(show)])),
+      insurance: this.insurance,
+      dealer: this.holeHidden && this.dealer.length ? [this.dealer[0].id, null] : this.dealer.map((c) => c.id),
+      dealerValue: dealerShown.length ? handValue(dealerShown) : null,
+      active: this.active,
+      currentPlayerId: this.currentPlayerId,
+      options: this.options(viewer),
+      waiting: this.waitingOn(),
+      results: this.results,
+      rules: { decks: this.opts.decks, h17: this.opts.h17, bjPays: this.opts.bjPays, surrender: this.opts.surrender, das: this.opts.das, minBet: this.opts.minBet, maxBet: this.opts.maxBet },
+      shoeLeft: this.shoe.length,
+      shoeSize: this.opts.decks * 52,
+      shuffled: this.shuffled,
+      turnMs: this.opts.turnMs,
+      seq: this.seq
+    };
+  }
+};
+
 // src/rooms/RoomManager.js
+var CASINO = /* @__PURE__ */ new Set(["poker", "blackjack"]);
+var POKER_STYLE_ORDER = ["tight", "aggro", "loose", "bluffer"];
+var BJ_STYLE_ORDER = ["basic", "cautious", "gambler"];
 var CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 var newId = () => randomBytes(8).toString("hex");
 var newToken = () => randomBytes(24).toString("hex");
@@ -2126,7 +3075,7 @@ var Room = class {
     this.code = code;
     this.hostId = null;
     this.players = /* @__PURE__ */ new Map();
-    this.settings = { mode: MODES.SAME, public: true, game: GAMES.LUEGEN, skVariant: "lang", skPass: "ramsch", skExtras: defaultExtras(), chessTime: "5+0", chessColor: "random" };
+    this.settings = { mode: MODES.SAME, public: true, game: GAMES.LUEGEN, skVariant: "lang", skPass: "ramsch", skExtras: defaultExtras(), chessTime: "5+0", chessColor: "random", pokerMode: "cash", pokerChips: 1e3, pokerBlinds: "5/10", turnSec: 30, bjDecks: 6, bjH17: false, bjPays: "3:2", bjSurrender: true };
     this.chessWhite = null;
     this.ready = /* @__PURE__ */ new Set();
     this.scores = new ScoreBook();
@@ -2147,6 +3096,7 @@ var Room = class {
   /** Läuft gerade eine Runde (bei Schafkopf auch während der Ansage)? */
   get active() {
     const p = this.game?.phase;
+    if (CASINO.has(this.game?.kind)) return p !== "over";
     return p === PHASES.PLAYING || p === "bidding" || p === "klopfen" || p === "wedding";
   }
   get humans() {
@@ -2335,6 +3285,7 @@ var RoomManager = class {
       room.personas[bot.id] = makePersona(bot.base, bot.difficulty);
       event = { type: "replaced", playerId, botId: bot.id, name: player.name, botName: bot.name };
     } else if (room.game?.kind === "chess") event = room.game.abandon(playerId);
+    else if (CASINO.has(room.game?.kind)) event = room.game.removePlayer(playerId);
     else if (room.game && room.game.phase === PHASES.PLAYING && room.game.kind !== "schafkopf") event = room.game.removePlayer(playerId);
     if (room.hostId === playerId) {
       const humans = room.humans;
@@ -2419,6 +3370,32 @@ var RoomManager = class {
       if (!["white", "black", "random"].includes(settings.chessColor)) throw new GameError("BAD_COLOR", "Unbekannte Farbe.");
       room.settings.chessColor = settings.chessColor;
     }
+    if (settings?.pokerMode !== void 0) {
+      if (!["cash", "tournament"].includes(settings.pokerMode)) throw new GameError("BAD_MODE", "Unbekannte Spielform.");
+      room.settings.pokerMode = settings.pokerMode;
+    }
+    if (settings?.pokerChips !== void 0) {
+      if (!POKER_CHIPS.includes(Number(settings.pokerChips))) throw new GameError("BAD_CHIPS", "Unbekannte Chip-Menge.");
+      room.settings.pokerChips = Number(settings.pokerChips);
+    }
+    if (settings?.pokerBlinds !== void 0) {
+      if (!POKER_BLINDS.includes(settings.pokerBlinds)) throw new GameError("BAD_BLINDS", "Unbekannte Blinds.");
+      room.settings.pokerBlinds = settings.pokerBlinds;
+    }
+    if (settings?.turnSec !== void 0) {
+      if (!TURN_SECONDS.includes(Number(settings.turnSec))) throw new GameError("BAD_TIME", "Unbekannte Zugzeit.");
+      room.settings.turnSec = Number(settings.turnSec);
+    }
+    if (settings?.bjDecks !== void 0) {
+      if (!BJ_DECKS.includes(Number(settings.bjDecks))) throw new GameError("BAD_DECKS", "Unbekannte Deck-Zahl.");
+      room.settings.bjDecks = Number(settings.bjDecks);
+    }
+    if (settings?.bjH17 !== void 0) room.settings.bjH17 = Boolean(settings.bjH17);
+    if (settings?.bjSurrender !== void 0) room.settings.bjSurrender = Boolean(settings.bjSurrender);
+    if (settings?.bjPays !== void 0) {
+      if (!["3:2", "6:5"].includes(settings.bjPays)) throw new GameError("BAD_PAYS", "Unbekannte Auszahlung.");
+      room.settings.bjPays = settings.bjPays;
+    }
     if (settings?.mode !== void 0) {
       if (!Object.values(MODES).includes(settings.mode)) throw new GameError("BAD_MODE", "Unbekannter Modus.");
       room.settings.mode = settings.mode;
@@ -2433,7 +3410,8 @@ var RoomManager = class {
       max: r.maxPlayers,
       mode: r.settings.mode,
       game: r.settings.game,
-      ...r.settings.game === GAMES.CHESS && { chessTime: r.settings.chessTime, chessColor: r.settings.chessColor }
+      ...r.settings.game === GAMES.CHESS && { chessTime: r.settings.chessTime, chessColor: r.settings.chessColor },
+      ...r.settings.game === GAMES.POKER && { pokerMode: r.settings.pokerMode, pokerBlinds: r.settings.pokerBlinds }
     })).slice(0, 50);
   }
   startGame(room, playerId) {
@@ -2442,6 +3420,7 @@ var RoomManager = class {
     room.pauses.clear();
     room.ready.clear();
     if (room.settings.game === GAMES.CHESS) return this.#startChess(room, false);
+    if (CASINO.has(room.settings.game)) return this.#startCasino(room);
     if (room.settings.game === GAMES.SCHAFKOPF) {
       while (room.players.size < GAME_MAX_PLAYERS.schafkopf) this.#createBot(room, "normal");
       room.game = new SchafkopfGame([...room.players.values()], { variant: room.settings.skVariant, pass: room.settings.skPass, extras: room.settings.skExtras });
@@ -2459,6 +3438,28 @@ var RoomManager = class {
     );
     const g = room.game;
     return { type: "started", startPlayerId: g.currentPlayerId, quads: g.initialQuads, oberLoserId: g.endReason === "ober" ? g.loserId : null, ended: g.phase !== "playing" };
+  }
+  #startCasino(room) {
+    const st = room.settings;
+    const poker = st.game === GAMES.POKER;
+    if (poker) while (room.players.size < 2) this.#createBot(room, "normal");
+    const seats = [...room.players.values()];
+    const bots = seats.filter((p) => p.bot);
+    room.personas = Object.fromEntries(
+      bots.map((p, i) => [
+        p.id,
+        poker ? { style: POKER_STYLE_ORDER[i % POKER_STYLE_ORDER.length], level: { easy: 0, normal: 1, hard: 2 }[p.difficulty] ?? 1 } : { style: BJ_STYLE_ORDER[i % BJ_STYLE_ORDER.length], betUnit: [10, 25, 50][i % 3] }
+      ])
+    );
+    room.botKey = null;
+    const turnMs = st.turnSec ? st.turnSec * 1e3 : 0;
+    if (poker) {
+      const [sb, bb] = st.pokerBlinds.split("/").map(Number);
+      room.game = new PokerGame(seats, { startChips: st.pokerChips, sb, bb, mode: st.pokerMode, turnMs });
+      return { type: "poker_start" };
+    }
+    room.game = new BlackjackGame(seats, { decks: st.bjDecks, h17: st.bjH17, bjPays: st.bjPays, surrender: st.bjSurrender, turnMs });
+    return { type: "bj_start" };
   }
   #startChess(room, swap) {
     const humans = room.humans;
@@ -2488,7 +3489,8 @@ var RoomManager = class {
   }
   backToLobby(room, playerId) {
     this.#assertHost(room, playerId);
-    if (room.active) throw new GameError("ALREADY_STARTED", "Das Spiel l\xE4uft noch.");
+    if (room.active && !CASINO.has(room.game?.kind)) throw new GameError("ALREADY_STARTED", "Das Spiel l\xE4uft noch.");
+    clearTimeout(room.casinoTimer);
     room.game = null;
     room.pauses.clear();
     room.ready.clear();
@@ -2628,9 +3630,9 @@ function currentWinner(trick, contract) {
   return trick[best];
 }
 function choosePlayCard(view, me, persona = {}, rand = Math.random, out = null) {
-  const R = (card, reason) => {
+  const R = (card2, reason) => {
     if (out) out.reason = reason;
-    return card;
+    return card2;
   };
   const legal = view.hand.filter((c2) => view.legalCardIds.includes(c2.id));
   if (legal.length <= 1) return R(legal[0], "Die einzige Karte, die du legen darfst.");
@@ -2735,8 +3737,181 @@ function skDecide(view, me, persona = {}) {
   if (view.phase !== "playing") return null;
   if (view.doubleKind && wantsDouble(view, persona)) return { type: "double", kind: view.doubleKind };
   if (!myTurn) return null;
-  const card = choosePlayCard(view, me, persona);
-  return card ? { type: "play", cardId: card.id } : null;
+  const card2 = choosePlayCard(view, me, persona);
+  return card2 ? { type: "play", cardId: card2.id } : null;
+}
+
+// ../shared/poker/bot.js
+var POKER_STYLES = {
+  tight: { label: "vorsichtig", vpip: -1.5, aggr: 0.35, bluff: 0.03 },
+  loose: { label: "locker", vpip: 1.5, aggr: 0.35, bluff: 0.06 },
+  aggro: { label: "aggressiv", vpip: 0.5, aggr: 0.75, bluff: 0.12 },
+  bluffer: { label: "Bluffer", vpip: 1, aggr: 0.6, bluff: 0.25 }
+};
+function chen(c1, c2) {
+  const v = (r) => ({ 14: 10, 13: 8, 12: 7, 11: 6 })[r] ?? r / 2;
+  const a = rankValue(c1[0]);
+  const b = rankValue(c2[0]);
+  const hi = Math.max(a, b);
+  const lo = Math.min(a, b);
+  let s = v(hi);
+  if (a === b) s = Math.max(5, s * 2);
+  if (c1[1] === c2[1]) s += 2;
+  const gap = hi - lo - 1;
+  if (a !== b) {
+    s -= gap <= 0 ? 0 : gap === 1 ? 1 : gap === 2 ? 2 : gap === 3 ? 4 : 5;
+    if (gap <= 1 && hi < 12) s += 1;
+  }
+  return Math.ceil(s);
+}
+function equity(hole, board, opponents, iters = 300, rand = Math.random) {
+  const used = /* @__PURE__ */ new Set([...hole, ...board]);
+  const rest = newDeck().filter((c) => !used.has(c.id));
+  const me = hole.map(card);
+  const b0 = board.map(card);
+  let win = 0;
+  for (let it = 0; it < iters; it++) {
+    const need = 5 - b0.length + opponents * 2;
+    for (let i = 0; i < need; i++) {
+      const j = i + Math.floor(rand() * (rest.length - i));
+      [rest[i], rest[j]] = [rest[j], rest[i]];
+    }
+    const bd = [...b0, ...rest.slice(0, 5 - b0.length)];
+    const mine = evaluate([...me, ...bd]).score;
+    let best = 0;
+    let ties = 0;
+    let off = 5 - b0.length;
+    for (let o = 0; o < opponents; o++) {
+      const sc = evaluate([rest[off], rest[off + 1], ...bd]).score;
+      off += 2;
+      if (sc > best) {
+        best = sc;
+        ties = 0;
+      }
+      if (sc === mine) ties++;
+    }
+    if (mine > best) win += 1;
+    else if (mine === best) win += 1 / (ties + 1);
+  }
+  return win / iters;
+}
+function pokerDecide(view, me, persona = {}, rand = Math.random) {
+  const o = view.options;
+  if (!o) return null;
+  const st = POKER_STYLES[persona.style] ?? POKER_STYLES.tight;
+  const level = persona.level ?? 1;
+  const hole = view.holes[me];
+  const active = view.inHand.filter((id) => !view.folded.includes(id));
+  const opp = Math.max(1, active.length - 1);
+  const pot = view.pot;
+  const toCall = o.toCall;
+  const odds = toCall > 0 ? toCall / (pot + toCall) : 0;
+  const noise = (1 - level * 0.35) * 0.12 * (rand() * 2 - 1);
+  const raiseTo = (frac) => {
+    const target = view.currentBet + Math.max(o.minTo - view.currentBet, Math.round((pot + toCall) * frac));
+    return Math.max(o.minTo, Math.min(o.maxTo, Math.round(target / view.bb) * view.bb || target));
+  };
+  const stackBB = view.stacks[me] / view.bb;
+  if (view.street === "preflop") {
+    const c = chen(hole[0], hole[1]) + st.vpip + noise * 10;
+    const idx = view.order.indexOf(me);
+    const btn = view.order.indexOf(view.button);
+    const late = (idx - btn + view.order.length) % view.order.length <= 1;
+    const threshold = (opp >= 4 ? 8 : opp >= 2 ? 6.5 : 5) - (late ? 1 : 0);
+    const facingRaise = view.currentBet > view.bb;
+    if (c >= 12 || c >= 10 && rand() < st.aggr) {
+      if (o.canRaise) return stackBB < 15 && c >= 11 ? { type: "allin" } : { type: "raise", to: raiseTo(facingRaise ? 1 : 0.8) };
+      return o.canCall ? { type: "call" } : { type: "check" };
+    }
+    if (c >= threshold + (facingRaise ? 2 : 0)) {
+      if (!facingRaise && o.canRaise && rand() < st.aggr * 0.6) return { type: "raise", to: raiseTo(0.7) };
+      if (o.canCheck) return { type: "check" };
+      if (toCall <= view.stacks[me] * (facingRaise ? 0.15 : 0.3)) return { type: "call" };
+      return { type: "fold" };
+    }
+    if (o.canCheck) return { type: "check" };
+    if (o.canRaise && rand() < st.bluff * 0.5 && !facingRaise) return { type: "raise", to: raiseTo(0.7) };
+    return { type: "fold" };
+  }
+  const iters = level === 0 ? 120 : level === 1 ? 250 : 450;
+  const eq = Math.max(0, Math.min(1, equity(hole, view.board, opp, iters, rand) + noise));
+  const strong = eq > 0.72 - st.aggr * 0.1;
+  if (o.canCheck) {
+    if (strong && o.canRaise) return { type: "raise", to: raiseTo(eq > 0.85 ? 0.9 : 0.6) };
+    if (eq > 0.55 && o.canRaise && rand() < st.aggr) return { type: "raise", to: raiseTo(0.5) };
+    if (o.canRaise && rand() < st.bluff && view.street !== "river") return { type: "raise", to: raiseTo(0.5) };
+    return { type: "check" };
+  }
+  if (strong && o.canRaise && rand() < 0.4 + st.aggr * 0.5) return eq > 0.9 && rand() < 0.3 ? { type: "allin" } : { type: "raise", to: raiseTo(0.8) };
+  const margin = level === 2 ? 0.02 : 0.05;
+  if (eq >= odds + margin) return { type: "call" };
+  if (o.canRaise && rand() < st.bluff * 0.4 && view.street === "turn") return { type: "raise", to: raiseTo(0.7) };
+  return { type: "fold" };
+}
+
+// ../shared/blackjack/strategy.js
+var up = (r) => r === "A" ? 11 : "TJQK".includes(r) ? 10 : Number(r);
+function basicStrategy(cardIds, dealerUp, options = {}, rules = {}) {
+  const cards = cardIds.map((id) => ({ rank: id[0], suit: id[1] }));
+  const d = up(dealerUp[0]);
+  const v = handValue(cards);
+  const two = cards.length === 2;
+  const h17 = rules.h17;
+  const want = (...prefs) => prefs.find((p) => p === "hit" || p === "stand" || options[p]) ?? "hit";
+  if (two && options.surrender && !v.soft) {
+    if (v.total === 16 && cards[0].rank !== "8" && d >= 9) return "surrender";
+    if (v.total === 15 && d === 10) return "surrender";
+    if (h17 && v.total === 15 && d === 11) return "surrender";
+  }
+  if (two && options.split && up(cards[0].rank) === up(cards[1].rank)) {
+    const r = up(cards[0].rank);
+    const das = rules.das !== false;
+    const split = r === 11 || r === 8 || r === 9 && ![7, 10, 11].includes(d) || r === 7 && d <= 7 || r === 6 && (d <= 6 && (d >= 3 || das)) || r === 4 && das && (d === 5 || d === 6) || (r === 2 || r === 3) && (d <= 7 && (d >= 4 || das));
+    if (split) return "split";
+  }
+  if (v.soft && v.total <= 21) {
+    const t2 = v.total;
+    if (t2 >= 20) return "stand";
+    if (t2 === 19) return d === 6 && two && h17 ? want("double", "stand") : "stand";
+    if (t2 === 18) {
+      if (d >= 3 && d <= 6) return want("double", "stand");
+      if (d === 2 && h17) return want("double", "stand");
+      if (d <= 8) return "stand";
+      return "hit";
+    }
+    if (t2 === 17) return d >= 3 && d <= 6 ? want("double", "hit") : "hit";
+    if (t2 === 15 || t2 === 16) return d >= 4 && d <= 6 ? want("double", "hit") : "hit";
+    if (t2 === 13 || t2 === 14) return d >= 5 && d <= 6 ? want("double", "hit") : "hit";
+    return "hit";
+  }
+  const t = v.total;
+  if (t >= 17) return "stand";
+  if (t >= 13) return d <= 6 ? "stand" : "hit";
+  if (t === 12) return d >= 4 && d <= 6 ? "stand" : "hit";
+  if (t === 11) return d === 11 && !h17 ? "hit" : want("double", "hit");
+  if (t === 10) return d <= 9 ? want("double", "hit") : "hit";
+  if (t === 9) return d >= 3 && d <= 6 ? want("double", "hit") : "hit";
+  return "hit";
+}
+function bjDecide(view, me, persona = {}, rand = Math.random) {
+  if (view.phase === "betting" && !view.ready.includes(me)) {
+    const unit = persona.betUnit ?? 25;
+    const chips = view.chips[me];
+    const mult = persona.style === "gambler" ? [1, 2, 4, 8][Math.floor(rand() * 4)] : persona.style === "cautious" ? 1 : [1, 1, 2, 3][Math.floor(rand() * 4)];
+    const amount = Math.max(view.rules.minBet, Math.min(chips, view.rules.maxBet, Math.round(unit * mult / 5) * 5));
+    return { type: "bet", amount };
+  }
+  if (view.phase === "insurance" && view.hands[me] && !(me in view.insurance)) {
+    return { type: "insure", yes: persona.style === "cautious" && rand() < 0.5 };
+  }
+  if (view.phase === "playing" && view.currentPlayerId === me && view.options) {
+    const h = view.hands[me][view.active.hand];
+    let a = basicStrategy(h.cards, view.dealer[0], view.options, view.rules);
+    if (persona.style === "cautious" && a === "hit" && h.value.total >= 12 && !h.value.soft) a = "stand";
+    if (persona.style === "gambler" && a === "hit" && view.options.double && h.value.total >= 8 && rand() < 0.3) a = "double";
+    return { type: "act", action: a };
+  }
+  return null;
 }
 
 // src/socket/handlers.js
@@ -2768,6 +3943,104 @@ function registerSocketHandlers(io, rooms, { pauseMs = DEFAULT_PAUSE_MS, botTimi
     }, wait + 25);
     room.chessTimer.unref?.();
   }
+  function casinoAction(room, fn) {
+    const g = room.game;
+    if (g?.kind !== "poker" && g?.kind !== "blackjack") throw new GameError("NOT_PLAYING", "Hier l\xE4uft kein Casino-Spiel.");
+    let event;
+    try {
+      event = fn(g);
+    } catch (err) {
+      if (err instanceof PokerError || err instanceof BlackjackError) throw new GameError(err.code, err.message);
+      throw err;
+    }
+    const flat = [];
+    const walk = (e) => {
+      if (!e || typeof e !== "object") return;
+      const { after, next, settle, over, ...rest } = e;
+      if (rest.type) flat.push(rest);
+      [after, next, settle, over].forEach(walk);
+    };
+    walk(event);
+    flat.forEach((e) => emitEvent(room, e));
+    broadcastState(room);
+  }
+  function scheduleCasino(room) {
+    const g = room.game;
+    if (!g || !rooms.rooms.has(room.code)) return;
+    const key2 = `${g.seq}`;
+    if (room.casinoKey === key2) return;
+    clearTimeout(room.casinoTimer);
+    room.casinoKey = key2;
+    const now = Date.now();
+    let delay = null;
+    let run = null;
+    const turnMs = g.opts.turnMs;
+    const isBot = (id) => room.isAuto(id) || !room.players.get(id);
+    const offline = (id) => room.players.get(id)?.connected === false;
+    if (g.kind === "poker") {
+      if (g.phase === "betting") {
+        const id = g.currentPlayerId;
+        if (isBot(id)) {
+          delay = between([botTiming.min, botTiming.max]);
+          run = () => {
+            const persona = room.personas?.[id] ?? { style: "tight", level: 1 };
+            const a = pokerDecide(g.getStateFor(id), id, persona) ?? { type: "fold" };
+            try {
+              casinoAction(room, (game) => game.act(id, a));
+            } catch {
+              casinoAction(room, (game) => game.timeout(id));
+            }
+          };
+        } else if (turnMs || offline(id)) {
+          delay = Math.max(0, (offline(id) ? Math.min(turnMs || 8e3, 8e3) : turnMs) - (now - g.turnStarted));
+          run = () => casinoAction(room, (game) => game.timeout(id));
+        }
+      } else if (g.phase === "showdown") {
+        delay = Math.max(0, (g.result?.uncontested ? 2600 : 5500) - (now - g.showdownAt));
+        run = () => casinoAction(room, (game) => game.nextHand());
+      }
+    } else {
+      const waiting = g.waitingOn();
+      const bot = waiting.find(isBot);
+      if (bot) {
+        delay = g.phase === "betting" ? between([300, 900]) : between([botTiming.min * 0.8, botTiming.max * 0.8]);
+        run = () => {
+          const d = bjDecide(g.getStateFor(bot), bot, room.personas?.[bot] ?? {});
+          casinoAction(room, (game) => {
+            if (d?.type === "bet") return game.bet(bot, d.amount);
+            if (d?.type === "insure") return game.insure(bot, d.yes);
+            if (d?.type === "act") return game.act(bot, d.action);
+            return game.timeout();
+          });
+        };
+      } else if (g.phase === "betting" && waiting.length) {
+        const allOff = waiting.every(offline);
+        delay = Math.max(0, (allOff ? 3e3 : g.opts.betMs) - (now - g.betStarted));
+        run = () => casinoAction(room, (game) => game.timeout());
+      } else if (g.phase === "insurance") {
+        delay = Math.max(0, 15e3 - (now - g.insStarted));
+        run = () => casinoAction(room, (game) => game.timeout());
+      } else if (g.phase === "playing" && (turnMs || offline(g.currentPlayerId))) {
+        delay = Math.max(0, (offline(g.currentPlayerId) ? 6e3 : turnMs) - (now - g.turnStarted));
+        run = () => casinoAction(room, (game) => game.timeout());
+      } else if (g.phase === "settled") {
+        delay = Math.max(0, 4500 - (now - g.settledAt));
+        run = () => casinoAction(room, (game) => game.nextRound());
+      }
+    }
+    if (delay == null) return;
+    const seq = g.seq;
+    room.casinoTimer = setTimeout(() => {
+      room.casinoKey = null;
+      if (room.game !== g || g.seq !== seq) return scheduleCasino(room);
+      try {
+        run();
+      } catch (err) {
+        console.error("[casino]", err);
+      }
+    }, delay);
+    room.casinoTimer.unref?.();
+  }
   function chessAction(room, fn) {
     if (room.game?.kind !== "chess") throw new GameError("NOT_PLAYING", "Hier l\xE4uft keine Schachpartie.");
     let event;
@@ -2790,6 +4063,7 @@ function registerSocketHandlers(io, rooms, { pauseMs = DEFAULT_PAUSE_MS, botTimi
       if (player.socketId) io.to(player.socketId).emit(EVT.ROOM_STATE, room.stateFor(player.id));
     }
     if (room.game?.kind === "chess") scheduleChessTimer(room);
+    else if (room.game?.kind === "poker" || room.game?.kind === "blackjack") scheduleCasino(room);
     else scheduleBot(room);
   }
   function emitEvent(room, event) {
@@ -2894,8 +4168,8 @@ function registerSocketHandlers(io, rooms, { pauseMs = DEFAULT_PAUSE_MS, botTimi
         console.error("[bot]", err);
         const view = game.getStateFor(bot.id);
         if (view.pendingOutId) return applyAction(room, bot.id, { type: "accept" });
-        const card = view.hand[0];
-        if (card) applyAction(room, bot.id, { type: "play", cardIds: [card.id], claimRank: view.requiredRank ?? "K", claimCount: 1 });
+        const card2 = view.hand[0];
+        if (card2) applyAction(room, bot.id, { type: "play", cardIds: [card2.id], claimRank: view.requiredRank ?? "K", claimCount: 1 });
       }
     }, delay);
     room.botTimer.unref?.();
@@ -2919,6 +4193,7 @@ function registerSocketHandlers(io, rooms, { pauseMs = DEFAULT_PAUSE_MS, botTimi
       player.autoplay = false;
       emitEvent(room, { type: "took_over", playerId: player.id, name: player.name });
     }
+    if (room.game?.kind === "poker" || room.game?.kind === "blackjack") room.casinoKey = null;
     if (player.abandonTimer) {
       clearTimeout(player.abandonTimer);
       player.abandonTimer = null;
@@ -3126,6 +4401,32 @@ function registerSocketHandlers(io, rooms, { pauseMs = DEFAULT_PAUSE_MS, botTimi
       broadcastState(room);
       return {};
     });
+    on(socket, EVT.POKER_ACT, ({ action } = {}) => {
+      const { room, player } = ctx(socket);
+      const a = { type: String(action?.type ?? ""), to: Number(action?.to) };
+      casinoAction(room, (g) => g.act(player.id, a));
+      return {};
+    });
+    on(socket, EVT.POKER_SHOW, () => {
+      const { room, player } = ctx(socket);
+      casinoAction(room, (g) => g.show(player.id));
+      return {};
+    });
+    on(socket, EVT.BJ_BET, ({ amount } = {}) => {
+      const { room, player } = ctx(socket);
+      casinoAction(room, (g) => g.bet(player.id, Number(amount)));
+      return {};
+    });
+    on(socket, EVT.BJ_INSURE, ({ yes } = {}) => {
+      const { room, player } = ctx(socket);
+      casinoAction(room, (g) => g.insure(player.id, Boolean(yes)));
+      return {};
+    });
+    on(socket, EVT.BJ_ACT, ({ action } = {}) => {
+      const { room, player } = ctx(socket);
+      casinoAction(room, (g) => g.act(player.id, String(action)));
+      return {};
+    });
     on(socket, EVT.PRESENCE_HELLO, ({ cid, name, activity }) => {
       const clean = (v, n) => String(v ?? "").replace(/[\u0000-\u001f\u007f<>]/g, "").trim().slice(0, n);
       const id = clean(cid, 40);
@@ -3221,6 +4522,9 @@ function registerSocketHandlers(io, rooms, { pauseMs = DEFAULT_PAUSE_MS, botTimi
           }
         }, chessAbandonMs);
         player.abandonTimer.unref?.();
+      } else if (room.game?.kind === "poker" || room.game?.kind === "blackjack") {
+        emitEvent(room, { type: "disconnected", playerId: player.id, name: player.name, casino: true });
+        room.casinoKey = null;
       } else if (room.active && room.game.order.includes(player.id)) {
         room.pauses.set(player.id, Date.now() + pauseMs);
         emitEvent(room, { type: "disconnected", playerId: player.id, name: player.name, pauseMs });
